@@ -227,6 +227,73 @@ export function extractContacts(text: string): { emails: string[]; phones: strin
   return { emails, phones };
 }
 
+// --- Core logic, reusable outside the MCP layer -------------------------
+// Factored out so the (future) sub-agent's internal tool loop can call the
+// exact same search/fetch behavior in-process, without round-tripping
+// through the MCP protocol a second time for what's really the same tool.
+
+export async function performWebSearch(query: string, maxResults: number): Promise<{ text: string } | { error: string }> {
+  const trimmed = query?.trim();
+  if (!trimmed) return { error: 'query is required' };
+  const capped = Math.min(Math.max(maxResults || 5, 1), 15);
+
+  let res: Response;
+  try {
+    res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { error: `Search request failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!res.ok) return { error: `Search returned HTTP ${res.status}` };
+
+  const html = await res.text();
+  const results = parseDuckDuckGoResults(html, capped);
+  log(`web_search: "${trimmed}" -> ${results.length} result(s)`);
+  if (results.length === 0) {
+    return { text: 'No results (or DuckDuckGo blocked/rate-limited this request — try again or rephrase the query).' };
+  }
+  return { text: results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n\n') };
+}
+
+export async function performWebFetch(rawUrl: string, maxChars: number): Promise<{ text: string } | { error: string }> {
+  const trimmed = rawUrl?.trim();
+  if (!trimmed) return { error: 'url is required' };
+  const capped = Math.min(Math.max(maxChars || 5000, 500), 20_000);
+
+  const check = await assertPublicUrl(trimmed);
+  if ('error' in check) return { error: check.error };
+
+  const fetched = await fetchFollowingRedirects(check.url, FETCH_TIMEOUT_MS);
+  if ('error' in fetched) return { error: fetched.error };
+  const { res } = fetched;
+  if (!res.ok) return { error: `Fetch returned HTTP ${res.status}` };
+
+  const contentLength = Number(res.headers.get('content-length') ?? '0');
+  if (contentLength > MAX_RESPONSE_BYTES) {
+    return { error: `Page too large (${contentLength} bytes > ${MAX_RESPONSE_BYTES} cap)` };
+  }
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('html') && !contentType.includes('text')) {
+    return { error: `Unsupported content-type: ${contentType || 'unknown'}` };
+  }
+
+  const html = await res.text();
+  if (html.length > MAX_RESPONSE_BYTES) {
+    return { error: `Page too large (${html.length} bytes > ${MAX_RESPONSE_BYTES} cap)` };
+  }
+  const text = htmlToReadableText(html, capped);
+  const { emails, phones } = extractContacts(text);
+
+  log(`web_fetch: ${fetched.finalUrl.href} -> ${text.length} chars, ${emails.length} email(s), ${phones.length} phone(s)`);
+
+  const parts = [text];
+  if (emails.length > 0) parts.push(`\n[emails found: ${emails.join(', ')}]`);
+  if (phones.length > 0) parts.push(`\n[phone numbers found: ${phones.join(', ')}]`);
+  return { text: parts.join('\n') };
+}
+
 // --- Tools ---------------------------------------------------------------
 
 export const webSearch: McpToolDefinition = {
@@ -244,28 +311,8 @@ export const webSearch: McpToolDefinition = {
     },
   },
   async handler(args) {
-    const query = (args.query as string)?.trim();
-    if (!query) return err('query is required');
-    const maxResults = Math.min(Math.max(Number(args.maxResults) || 5, 1), 15);
-
-    let res: Response;
-    try {
-      res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-        headers: { 'User-Agent': USER_AGENT },
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
-    } catch (e) {
-      return err(`Search request failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    if (!res.ok) return err(`Search returned HTTP ${res.status}`);
-
-    const html = await res.text();
-    const results = parseDuckDuckGoResults(html, maxResults);
-    log(`web_search: "${query}" -> ${results.length} result(s)`);
-    if (results.length === 0) {
-      return ok('No results (or DuckDuckGo blocked/rate-limited this request — try again or rephrase the query).');
-    }
-    return ok(results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n\n'));
+    const result = await performWebSearch(args.query as string, Number(args.maxResults));
+    return 'error' in result ? err(result.error) : ok(result.text);
   },
 };
 
@@ -284,40 +331,8 @@ export const webFetch: McpToolDefinition = {
     },
   },
   async handler(args) {
-    const rawUrl = (args.url as string)?.trim();
-    if (!rawUrl) return err('url is required');
-    const maxChars = Math.min(Math.max(Number(args.maxChars) || 5000, 500), 20_000);
-
-    const check = await assertPublicUrl(rawUrl);
-    if ('error' in check) return err(check.error);
-
-    const fetched = await fetchFollowingRedirects(check.url, FETCH_TIMEOUT_MS);
-    if ('error' in fetched) return err(fetched.error);
-    const { res } = fetched;
-    if (!res.ok) return err(`Fetch returned HTTP ${res.status}`);
-
-    const contentLength = Number(res.headers.get('content-length') ?? '0');
-    if (contentLength > MAX_RESPONSE_BYTES) {
-      return err(`Page too large (${contentLength} bytes > ${MAX_RESPONSE_BYTES} cap)`);
-    }
-    const contentType = res.headers.get('content-type') ?? '';
-    if (!contentType.includes('html') && !contentType.includes('text')) {
-      return err(`Unsupported content-type: ${contentType || 'unknown'}`);
-    }
-
-    const html = await res.text();
-    if (html.length > MAX_RESPONSE_BYTES) {
-      return err(`Page too large (${html.length} bytes > ${MAX_RESPONSE_BYTES} cap)`);
-    }
-    const text = htmlToReadableText(html, maxChars);
-    const { emails, phones } = extractContacts(text);
-
-    log(`web_fetch: ${fetched.finalUrl.href} -> ${text.length} chars, ${emails.length} email(s), ${phones.length} phone(s)`);
-
-    const parts = [text];
-    if (emails.length > 0) parts.push(`\n[emails found: ${emails.join(', ')}]`);
-    if (phones.length > 0) parts.push(`\n[phone numbers found: ${phones.join(', ')}]`);
-    return ok(parts.join('\n'));
+    const result = await performWebFetch(args.url as string, Number(args.maxChars));
+    return 'error' in result ? err(result.error) : ok(result.text);
   },
 };
 

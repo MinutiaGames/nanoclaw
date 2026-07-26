@@ -156,6 +156,15 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     provider: providerOptions,
     instructions,
     mcp,
+    // OpenCode's MCP client hard-kills a tool call at 60s regardless of a
+    // per-server `timeout` config (that field only governs the startup
+    // tool-listing fetch — confirmed against the SDK's own type defs — and
+    // per-server call timeouts are a known-broken path upstream). This is
+    // the documented global workaround: github.com/anomalyco/opencode/
+    // issues/8701. Matters for delegate_web_research (mcp-tools/delegate.ts),
+    // whose own internal budget is real work on this hardware, not padding —
+    // keep this comfortably above that budget, not unbounded.
+    experimental: { mcp_timeout: 300_000 },
   };
 }
 
