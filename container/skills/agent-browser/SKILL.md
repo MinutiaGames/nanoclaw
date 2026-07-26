@@ -45,6 +45,33 @@ agent-browser snapshot -d 3       # Limit depth to 3
 agent-browser snapshot -s "#main" # Scope to CSS selector
 ```
 
+**`-i` only shows interactive elements (links, buttons, inputs) — it will
+NOT show static content like a results table, a list of search hits, or any
+other read-only text.** This is a common trap right after a search/filter/
+submit: the form's `-i` snapshot found the fields fine, but a second `-i`
+snapshot taken to read the *results* comes back looking empty even though
+the page clearly has content.
+
+When you need to read static output rather than find something to interact
+with, a full unscoped `snapshot` is the LAST resort, not a next step — on a
+real content-heavy page (government/enterprise sites especially) it can
+return 70KB+ in one call, easily tens of thousands of tokens dumped into
+your context in a single tool result. That alone has been enough to derail
+a turn. Never reach for it just because `-i` came up empty.
+
+Do this instead, in order:
+1. **Don't know the results container's selector?** Start with
+   `snapshot -d 2` (or `-d 3`) — depth-limited, so it stays small — to see
+   the page's top-level structure and find a real selector (an id/class on
+   the wrapper around the results) without needing to know it in advance.
+2. **Once you have that selector**, scope precisely:
+   `snapshot -s "#resultsContainer"`, or `get text @ref`/`get html @ref`
+   once you have a ref to that container. Scoping stays small regardless of
+   page size — this is the normal way to read results, not a fallback.
+3. Only fall back to a full unscoped `snapshot` if steps 1–2 genuinely
+   don't locate the content, and treat the resulting size as expected, not
+   a bug — budget for it before calling it.
+
 ### Interactions (use @refs from snapshot)
 
 ```bash
