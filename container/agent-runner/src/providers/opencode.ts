@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'child_process';
 
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 
+import { clearContinuationModel, getContinuationModel, setContinuationModel } from '../db/session-state.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
@@ -15,6 +16,28 @@ const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 /** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
 const STALE_SESSION_RE =
   /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
+
+/**
+ * Race a promise (typically `stream.next()`) against a timeout signal, so a
+ * caller can bail out even when the underlying promise never settles.
+ *
+ * Exists because `AsyncGenerator.return()` isn't reliably able to interrupt
+ * an in-flight `.next()` read on OpenCode's SSE stream — an idle-timeout
+ * that only set a flag and called `.return()` left the read blocked forever
+ * in practice, while the interval driving the timeout kept re-firing every
+ * poll tick (see the caller) since it had no way to know the loop never
+ * actually unblocked. Racing here guarantees forward progress regardless of
+ * whether the underlying stream cooperates.
+ */
+export function raceNextAgainstTimeout<T>(
+  next: Promise<T>,
+  timeoutSignal: Promise<void>,
+): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+  return Promise.race([
+    next.then((value) => ({ timedOut: false as const, value })),
+    timeoutSignal.then(() => ({ timedOut: true as const })),
+  ]);
+}
 
 function killProcessTree(proc: ChildProcess): void {
   if (!proc.pid) return;
@@ -229,6 +252,22 @@ export class OpenCodeProvider implements AgentProvider {
     return STALE_SESSION_RE.test(msg);
   }
 
+  // OpenCode ties a session to whatever model was loaded when it was
+  // created; resuming it against a different model 404s. Unlike Claude's
+  // resolved `options.model`, OpenCode's effective model comes from
+  // `OPENCODE_MODEL` (see buildOpenCodeConfig) — compare against that
+  // directly rather than `this.options.model`, which OpenCode never sets.
+  // A stored value of `undefined` (pre-fix installs, or a session created
+  // before this tracking existed) is treated as a mismatch so it self-heals
+  // on the next restart instead of hanging on a guaranteed-stale resume.
+  maybeRotateContinuation(): string | null {
+    const currentModel = process.env.OPENCODE_MODEL ?? '';
+    const storedModel = getContinuationModel('opencode');
+    if ((storedModel ?? '') === currentModel) return null;
+    clearContinuationModel('opencode');
+    return `model changed (${storedModel ?? 'unknown'} -> ${currentModel || 'unknown'})`;
+  }
+
   query(input: QueryInput): AgentQuery {
     if (input.continuation) {
       this.activeSessionId = input.continuation;
@@ -278,6 +317,7 @@ export class OpenCodeProvider implements AgentProvider {
           sessionId = created.data?.id;
           if (!sessionId) throw new Error('OpenCode: failed to create session (no id)');
           self.activeSessionId = sessionId;
+          setContinuationModel('opencode', process.env.OPENCODE_MODEL ?? '');
         }
 
         if (!initYielded) {
@@ -298,12 +338,26 @@ export class OpenCodeProvider implements AgentProvider {
         const roleByMessageId = new Map<string, string>();
         let lastEventAt = Date.now();
         let eventTimedOut = false;
+        // Resolves once the idle timeout fires, so the loop below can bail
+        // out of a blocked `stream.next()` even if `destroySharedRuntime()`'s
+        // `stream.return()` doesn't actually interrupt an in-flight read
+        // (observed in practice: relying on that alone left the turn stuck
+        // forever, while this interval kept re-firing every 5s — since it
+        // never cleared itself once the condition went true — logging the
+        // same "clearing session" line indefinitely without ever unsticking
+        // anything).
+        let signalTimedOut: (() => void) | undefined;
+        const timedOut = new Promise<void>((resolve) => {
+          signalTimedOut = resolve;
+        });
         const timeoutCheck = setInterval(() => {
           if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
+            clearInterval(timeoutCheck);
             log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${sessionId}`);
             eventTimedOut = true;
             self.activeSessionId = undefined;
             destroySharedRuntime();
+            signalTimedOut?.();
             kick();
           }
         }, 5000);
@@ -315,7 +369,11 @@ export class OpenCodeProvider implements AgentProvider {
               throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
             }
 
-            const { value: ev, done } = await stream.next();
+            const outcome = await raceNextAgainstTimeout(stream.next(), timedOut);
+            if (outcome.timedOut) {
+              throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
+            }
+            const { value: ev, done } = outcome.value;
             if (done) {
               throw new Error('OpenCode SSE stream ended unexpectedly');
             }

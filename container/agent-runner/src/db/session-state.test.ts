@@ -3,9 +3,12 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
   clearContinuation,
+  clearContinuationModel,
   getContinuation,
+  getContinuationModel,
   migrateLegacyContinuation,
   setContinuation,
+  setContinuationModel,
 } from './session-state.js';
 
 beforeEach(() => {
@@ -46,6 +49,42 @@ describe('session-state — per-provider continuations', () => {
 
   test('unknown provider returns undefined', () => {
     expect(getContinuation('never-used')).toBeUndefined();
+  });
+});
+
+describe('session-state — continuation model tracking', () => {
+  test('set/get round-trip, isolated per provider', () => {
+    setContinuationModel('opencode', 'lmstudio/qwen/qwen3.5-9b');
+    setContinuationModel('claude', 'sonnet');
+
+    expect(getContinuationModel('opencode')).toBe('lmstudio/qwen/qwen3.5-9b');
+    expect(getContinuationModel('claude')).toBe('sonnet');
+  });
+
+  test('clearContinuationModel only affects the specified provider', () => {
+    setContinuationModel('opencode', 'keep-me');
+    setContinuationModel('claude', 'drop-me');
+
+    clearContinuationModel('claude');
+
+    expect(getContinuationModel('opencode')).toBe('keep-me');
+    expect(getContinuationModel('claude')).toBeUndefined();
+  });
+
+  test('unset model returns undefined', () => {
+    expect(getContinuationModel('opencode')).toBeUndefined();
+  });
+
+  test('does not collide with the continuation value itself', () => {
+    setContinuation('opencode', 'ses_abc123');
+    setContinuationModel('opencode', 'lmstudio/gemma');
+
+    expect(getContinuation('opencode')).toBe('ses_abc123');
+    expect(getContinuationModel('opencode')).toBe('lmstudio/gemma');
+
+    clearContinuation('opencode');
+    expect(getContinuation('opencode')).toBeUndefined();
+    expect(getContinuationModel('opencode')).toBe('lmstudio/gemma');
   });
 });
 

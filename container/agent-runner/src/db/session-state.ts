@@ -79,6 +79,29 @@ export function clearContinuation(providerName: string): void {
 }
 
 /**
+ * Companion to the continuation itself: which model the stored session was
+ * created under. Providers that resolve their model from config rather than
+ * `ProviderOptions.model` (e.g. OpenCode, via `OPENCODE_MODEL`) use this to
+ * detect a model swap and rotate away from a continuation that's guaranteed
+ * to 404 against the new model's backend.
+ */
+function continuationModelKey(providerName: string): string {
+  return `${continuationKey(providerName)}:model`;
+}
+
+export function getContinuationModel(providerName: string): string | undefined {
+  return getValue(continuationModelKey(providerName));
+}
+
+export function setContinuationModel(providerName: string, model: string): void {
+  setValue(continuationModelKey(providerName), model);
+}
+
+export function clearContinuationModel(providerName: string): void {
+  deleteValue(continuationModelKey(providerName));
+}
+
+/**
  * The a2a reply stamp: the id of the first inbound message in the batch the
  * agent is currently processing. The poll loop publishes it at batch start;
  * MCP tools (`send_message`, `send_file`) read it and stamp it onto outbound
