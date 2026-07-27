@@ -26,6 +26,7 @@ const OPENCODE_ENV_KEYS = [
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
   'ANTHROPIC_BASE_URL',
+  'OPENCODE_IDLE_TIMEOUT_MS',
 ] as const;
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
