@@ -37,7 +37,14 @@ const MAX_SUBAGENT_TURNS = 6;
 // this budget has real headroom now — but it must still stay safely under
 // that outer ceiling, or the graceful degradation below never gets a
 // chance to run before the outer timeout kills the call outright.
-const SUBAGENT_TIMEOUT_MS = 180_000;
+//
+// Raised 180s -> 250s (2026-07-27) after real per-request timing data
+// showed the 60s-per-request cap was rarely the actual bottleneck (9/12
+// real requests completed in 4-56s, well under it) — the sub-agent was
+// instead running out of its own TOTAL budget after just 3-4 such
+// requests, since each one alone can take 25-55s on this hardware. 250s
+// leaves a 50s margin under the outer 300s ceiling above.
+const SUBAGENT_TIMEOUT_MS = 250_000;
 const SUBAGENT_REQUEST_TIMEOUT_MS = 60_000;
 const SUBAGENT_MAX_TOKENS = 800;
 
@@ -123,12 +130,44 @@ export function resolveSubAgentModelConfig(): { chatCompletionsUrl: string; mode
   return { chatCompletionsUrl: `${baseUrl.replace(/\/$/, '')}/chat/completions`, model: strippedModel };
 }
 
+// Directed at the TOP-LEVEL model reading this tool's result, not the sub-agent
+// (whose own loop already ended by the time this text is produced). Repeated
+// here — not just in the tool description — because the description is easy
+// to lose track of once a real task is underway, and this is the moment the
+// top-level model is actually deciding what to do next. See project memory
+// (2026-07-27): every model tested has, at some point, treated a failed/
+// partial delegate result as something to complete itself — inventing a
+// plausible-sounding answer (wrong city, fabricated contact) rather than
+// reporting the gap. The top-level model's job is orchestration, not research.
+//
+// Deliberately a hard "one attempt, then stop" rule, NOT "retry, then stop"
+// (changed 2026-07-27). A "retry" framing was tried first and backfired: the
+// top-level model retried the exact request once as instructed, but when
+// that failed too it kept going — rephrasing the task twice more, and on the
+// last attempt injecting its OWN guessed city into the delegate task itself
+// ("...near Davenport/Marion, IA") rather than reporting the gap. The
+// sub-agent then correctly, honestly found real Davenport businesses for
+// that invented premise — no hallucination in the sub-agent at all, but a
+// wrong final answer wrapped in real-looking data, which is harder to catch
+// than an outright fabrication. Permitting any retry apparently reads as
+// license to keep iterating/adjusting the query until something comes back;
+// removing that permission entirely closes the loophole.
+const FAILURE_GUIDANCE =
+  'This is a FAILED delegate call, not a completed answer. Do not treat anything below as verified, ' +
+  'do not guess or invent the missing information, and do not fall back to searching/fetching this ' +
+  'yourself. Do NOT call delegate_web_research again for this same piece of research — one attempt only. ' +
+  'Report this specific item as unavailable and move on, or stop and flag the failure if it blocks the ' +
+  'whole task.';
+
 function summarizePartial(messages: SubAgentMessage[], reason: string): string {
   const toolResults = messages
     .filter((m) => m.role === 'tool' && m.content)
     .map((m) => m.content as string);
-  if (toolResults.length === 0) return `Sub-agent stopped early (${reason}) with no findings.`;
-  return `Sub-agent stopped early (${reason}). Partial findings gathered:\n\n${toolResults.join('\n\n')}`;
+  if (toolResults.length === 0) return `Sub-agent stopped early (${reason}) with no findings. ${FAILURE_GUIDANCE}`;
+  return (
+    `Sub-agent stopped early (${reason}). ${FAILURE_GUIDANCE}\n\n` +
+    `Unverified raw data gathered before the failure (do not present as fact):\n\n${toolResults.join('\n\n')}`
+  );
 }
 
 /**
@@ -136,11 +175,12 @@ function summarizePartial(messages: SubAgentMessage[], reason: string): string {
  * response) should still salvage completed tool results rather than
  * discard them — a request timing out on turn 3 doesn't undo the
  * successful web_search from turn 1. Only fall back to a bare error when
- * there's genuinely nothing gathered yet to report instead.
+ * there's genuinely nothing gathered yet to report instead. Either way the
+ * result is a FAILURE, not a completed answer — see FAILURE_GUIDANCE.
  */
 function failOrSalvage(messages: SubAgentMessage[], bareError: string, salvageReason: string): string {
   const hasFindings = messages.some((m) => m.role === 'tool' && m.content);
-  return hasFindings ? summarizePartial(messages, salvageReason) : bareError;
+  return hasFindings ? summarizePartial(messages, salvageReason) : `${bareError} ${FAILURE_GUIDANCE}`;
 }
 
 export interface RunSubAgentOptions {
@@ -173,6 +213,8 @@ export async function runSubAgent(task: string, opts: RunSubAgentOptions = {}): 
     if (remaining <= 0) return summarizePartial(messages, 'exceeded its time budget');
 
     let res: Response;
+    const requestBudgetMs = Math.min(remaining, SUBAGENT_REQUEST_TIMEOUT_MS);
+    const requestStarted = Date.now();
     try {
       res = await fetch(config.chatCompletionsUrl, {
         method: 'POST',
@@ -183,10 +225,15 @@ export async function runSubAgent(task: string, opts: RunSubAgentOptions = {}): 
           tools: SUBAGENT_TOOLS,
           max_tokens: SUBAGENT_MAX_TOKENS,
         }),
-        signal: AbortSignal.timeout(Math.min(remaining, SUBAGENT_REQUEST_TIMEOUT_MS)),
+        signal: AbortSignal.timeout(requestBudgetMs),
       });
+      log(`sub-agent turn ${turn}: model request took ${Date.now() - requestStarted}ms (budget ${requestBudgetMs}ms)`);
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
+      log(
+        `sub-agent turn ${turn}: model request FAILED after ${Date.now() - requestStarted}ms ` +
+          `(budget ${requestBudgetMs}ms): ${reason}`,
+      );
       return failOrSalvage(messages, `Sub-agent request failed: ${reason}`, `a request failed (${reason})`);
     }
     if (!res.ok) {
@@ -234,7 +281,7 @@ export const delegateWebResearch: McpToolDefinition = {
   tool: {
     name: 'delegate_web_research',
     description:
-      'Delegate a narrow, self-contained web research task (e.g. "find the phone number and email for Jane Doe, CPA in Marion IA") to a sub-agent and get back a distilled answer. Use this instead of doing the search/fetch/browse yourself when a task is well-scoped enough to hand off — the sub-agent runs independently and only its final answer re-enters this conversation, so the raw pages, search noise, and dead ends it works through never bloat your own context.',
+      'Delegate a narrow, self-contained web research task (e.g. "find the phone number and email for Jane Doe, CPA in Marion IA") to a sub-agent and get back a distilled answer. Use this instead of doing the search/fetch/browse yourself when a task is well-scoped enough to hand off — the sub-agent runs independently and only its final answer re-enters this conversation, so the raw pages, search noise, and dead ends it works through never bloat your own context. Your role is orchestration and planning, not research — if this tool times out, fails, or comes back with no answer, do NOT fall back to searching/fetching it yourself, do NOT guess or invent an answer to fill the gap, and do NOT call it again for the same piece of research (one attempt per item — do not rephrase or add assumptions and try again). Report that specific item as unavailable and move on, or stop and flag the failure if it blocks the whole task.',
     inputSchema: {
       type: 'object' as const,
       properties: {
