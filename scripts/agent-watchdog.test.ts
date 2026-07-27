@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { detectRepeatedToolCall, detectSameToolStreak, type ToolCallRecord } from './agent-watchdog';
+import { detectRepeatedToolCall, detectSameToolStreak, detectEscalatingRetry, type ToolCallRecord } from './agent-watchdog';
 
 function call(tool: string, input: unknown): ToolCallRecord {
   return { tool, inputJson: JSON.stringify(input) };
@@ -109,5 +109,67 @@ describe('detectSameToolStreak', () => {
     const history = [call('bash', { command: 'a' })];
     expect(detectSameToolStreak(history, 1)).toBeNull();
     expect(detectSameToolStreak(history, 0)).toBeNull();
+  });
+});
+
+describe('detectEscalatingRetry', () => {
+  // Real pattern observed 2026-07-27: delegate_web_research called 4x for
+  // one task — a sanctioned identical retry, then two more calls each
+  // extending the prior text, the last one injecting a self-guessed city
+  // ("Davenport/Marion, IA") after the first attempts failed. Neither
+  // detectRepeatedToolCall (arguments differ from call 3 on) nor
+  // detectSameToolStreak alone (arguments look "varied", same as any
+  // healthy multi-call use) reliably flags this — the escalating shared
+  // text is the actual signal.
+  const base =
+    'Find 5 CPAs (Certified Public Accountant) within 25 miles of zip code 52302. For each CPA, provide their Name, City, Phone Number, and Email Address.';
+
+  it('detects the real Davenport/Marion escalating-retry pattern', () => {
+    const history = [
+      call('delegate_web_research', { task: base }),
+      call('delegate_web_research', { task: base }),
+      call('delegate_web_research', { task: `${base} Use the Iowa Society of CPAs directory and Yelp.` }),
+      call('delegate_web_research', {
+        task: `${base} Based on search results, identify 5 firms in or very near Davenport/Marion, IA and extract details.`,
+      }),
+    ];
+    const result = detectEscalatingRetry(history, 3);
+    expect(result?.tool).toBe('delegate_web_research');
+    // Extends back through all 4, including the original + its identical retry.
+    expect(result?.count).toBe(4);
+  });
+
+  it('does not flag genuinely different narrow tasks for the same tool', () => {
+    const history = [
+      call('delegate_web_research', { task: 'Find the phone number for Jane Doe CPA in Marion IA.' }),
+      call('delegate_web_research', { task: 'Find the email address for John Smith CPA in Cedar Rapids IA.' }),
+      call('delegate_web_research', { task: 'Find the office hours for Acme Tax Services in Marion IA.' }),
+    ];
+    expect(detectEscalatingRetry(history, 3)).toBeNull();
+  });
+
+  it('does not flag short, coincidentally-similar arguments', () => {
+    const history = [
+      call('web_search', { query: 'CPA 52302' }),
+      call('web_search', { query: 'CPA 52302 email' }),
+      call('web_search', { query: 'CPA 52302 phone' }),
+    ];
+    expect(detectEscalatingRetry(history, 3)).toBeNull();
+  });
+
+  it('returns null when the tail calls use different tools', () => {
+    const history = [call('delegate_web_research', { task: base }), call('web_fetch', { url: 'https://x' }), call('delegate_web_research', { task: base })];
+    expect(detectEscalatingRetry(history, 3)).toBeNull();
+  });
+
+  it('returns null when history is shorter than threshold', () => {
+    const history = [call('delegate_web_research', { task: base }), call('delegate_web_research', { task: base })];
+    expect(detectEscalatingRetry(history, 3)).toBeNull();
+  });
+
+  it('rejects a threshold below 2 as meaningless', () => {
+    const history = [call('bash', { command: 'a' })];
+    expect(detectEscalatingRetry(history, 1)).toBeNull();
+    expect(detectEscalatingRetry(history, 0)).toBeNull();
   });
 });
