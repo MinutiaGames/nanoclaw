@@ -49,7 +49,7 @@ if [ ! -d "$SESS_DIR" ]; then
 fi
 
 echo "=== Full session wipe ==="
-docker ps --format '{{.Names}}' | grep -i ping-test | xargs -r docker stop
+docker ps --format '{{.Names}}' | grep -i ping-test | xargs -r docker stop || true
 rm -rf "${SESS_DIR}/opencode-xdg"
 pnpm exec tsx scripts/q.ts "$OUTBOUND_DB" "DELETE FROM session_state WHERE key LIKE 'continuation%'" >/dev/null
 # A run stopped mid-flight (e.g. after finding a bug worth fixing before

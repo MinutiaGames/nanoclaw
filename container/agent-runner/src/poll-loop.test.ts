@@ -436,6 +436,58 @@ describe('error result with no <message> envelope', () => {
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
   });
+
+  it('delivers a fallback notice once the wrapping retry is exhausted, instead of silently dropping it', async () => {
+    // Regression test: observed live with gemma-3-1b-it-qat — two
+    // consecutive off-task, unwrapped replies (chatbot filler, never a
+    // <message> block) in one query. The first unwrapped result correctly
+    // gets the one-shot re-wrap nudge; the second also comes back
+    // unwrapped, and since only one nudge is allowed per turn, this
+    // previously fell through to a silent archivePrompts.shift() with
+    // nothing ever delivered — the same silent-drop shape as the
+    // empty-text case above, just reached via non-empty-but-unwrapped text.
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: "Okay, I understand. Let's begin. How can I help you today?" };
+      yield { type: 'result', text: "Okay, I understand. Let's try again. I'm ready to help." };
+    }
+    const query: AgentQuery = {
+      push: (m: string) => pushes.push(m),
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(
+      "The agent's response could not be delivered — it still wasn't sent in a valid <message> block after being asked to resend it correctly.",
+    );
+    // Exactly one nudge — no second nudge once the retry is exhausted.
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('was not delivered');
+  });
+
+  it('delivers a fallback notice for a turn with no text at all, instead of silently dropping it', async () => {
+    // Regression test: a turn whose only output landed in a reasoning part
+    // (not a text part) previously fell through with zero user-facing
+    // signal — no reply, no error, no nudge — leaving the query open
+    // waiting for a next message that never comes. Indistinguishable from
+    // a hang from the outside. Observed live with local models writing a
+    // fake tool-call as chain-of-thought instead of a real tool call.
+    const { query, pushes } = makeResultQuery({ type: 'result', text: null });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe("The agent's turn ended without producing a response.");
+    // No re-wrap nudge — there's no text to re-wrap.
+    expect(pushes).toHaveLength(0);
+  });
 });
 
 describe('isCorruptionError', () => {

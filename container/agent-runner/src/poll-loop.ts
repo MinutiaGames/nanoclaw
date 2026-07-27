@@ -525,11 +525,28 @@ export async function processQuery(
             archivePrompts.shift();
           } else {
             const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+            // Wrapping retry exhausted: the one allowed nudge already fired
+            // on a prior result this turn, and the model STILL didn't wrap
+            // its output in a <message> block (hasUnwrapped is only ever
+            // true for non-task-run sessions — see its definition above).
+            // Previously this fell through to a silent archivePrompts.shift()
+            // with nothing delivered — same silent-drop shape as the empty-
+            // text case above, just reached via non-empty-but-unwrapped text
+            // instead. Observed live: gemma-3-1b-it-qat replying with
+            // off-task chatbot filler twice in a row, never wrapped either
+            // time, then going silent for the rest of the turn.
+            const wrappingExhausted = hasUnwrapped && unwrappedNudged;
+            if (wrappingExhausted) {
+              deliverErrorResult(
+                "The agent's response could not be delivered — it still wasn't sent in a valid <message> block after being asked to resend it correctly.",
+                routing,
+              );
+            }
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
+              status: wrappingExhausted ? 'error' : hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
             });
             if (willRetryWrapping) {
               unwrappedNudged = true;
@@ -554,7 +571,28 @@ export async function processQuery(
             // not the nudge text.
             if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
           }
-        } else archivePrompts.shift();
+        } else {
+          // A turn that ends with no text at all (e.g. the model's only
+          // output landed in a reasoning part instead of a text part —
+          // observed with local models writing a fake tool-call as
+          // chain-of-thought instead of a real tool invocation) previously
+          // fell through here silently: no reply, no error, nothing logged
+          // beyond the raw "Result: (empty)" line. From the user's side
+          // that's indistinguishable from a hang, since the query then
+          // correctly stays open waiting for a next message that never
+          // comes. Treat it the same as the non-retryable-error case above
+          // so the user always gets *something* back.
+          if (!routing.taskRun) {
+            deliverErrorResult("The agent's turn ended without producing a response.", routing);
+          }
+          notifyExchangeComplete(onExchangeComplete, {
+            prompt: archivePrompts[0] ?? initialPrompt,
+            result: '',
+            continuation: queryContinuation ?? initialContinuation,
+            status: 'error',
+          });
+          archivePrompts.shift();
+        }
       }
     }
   } catch (err) {
