@@ -1,8 +1,11 @@
 # LM Studio model-loading issue — handoff for Windows-side investigation
 
-This is a narrow, standalone handoff about one specific problem: **LM Studio
-increasingly fails to load models**, even small ones, and needs either a
-setting reduction or a full restart to recover. It's written for a fresh
+This is a narrow, standalone handoff about two related problems: **LM
+Studio increasingly fails to load models** (even small ones, needing a
+setting reduction or full restart to recover), and **its server connection
+has been observed dropping mid-request** while a model is actively
+running. Both point at the same underlying goal: reliably load a model and
+keep the server running under sustained use. It's written for a fresh
 Claude session running *on the Windows side* (where LM Studio actually
 runs), since the WSL/Linux side (where the rest of this project lives) has
 no direct access to LM Studio's process, logs, or GPU driver state.
@@ -54,6 +57,35 @@ no direct access to LM Studio's process, logs, or GPU driver state.
   but that's a separate phenomenon from LM Studio's own load failures,
   since LM Studio is a native Windows process, not something running
   inside WSL2's VM.
+
+## Live data point: server connection dropped mid-request (2026-07-27)
+
+While testing `google/gemma-4-12b-qat` (temp lowered from LM Studio's
+default of 1.0 to 0.3, otherwise unchanged config) from the WSL/Linux
+side, one request failed with a bare `"terminated"` error — Node's
+generic error for a connection that was closed unexpectedly mid-stream
+(not a timeout, not a malformed response, not an application-level
+error from the model). Sequence of events:
+
+1. Turn 1 (462.7s): model called the project's `delegate_web_research`
+   tool, which itself timed out against LM Studio — a normal, expected
+   failure mode, handled cleanly.
+2. Turn 2 (370.7s): the *next* request to LM Studio's own
+   `/v1/chat/completions`-equivalent endpoint (via its OpenAI-compatible
+   API) errored with `"terminated"` after over 6 minutes — the
+   connection was severed, not answered. No further detail was available
+   from the client side; the WSL-side container log shows only
+   `Query error: "terminated"`.
+
+This reads as LM Studio's backend server process itself dying, restarting,
+or being killed mid-request (e.g. by an OS-level OOM kill, a GPU
+driver/VRAM fault, or an internal crash) — not a model producing bad
+output. It's consistent with the load-failure symptom above and with the
+"only recovers after a full restart" pattern: if the backend process is
+actually crashing under sustained load, both symptoms (can't load a new
+model, active requests silently die) could share one root cause rather
+than being two separate bugs. Worth checking LM Studio's own crash/error
+logs around this specific timeframe if timestamps are still available.
 
 ## Working hypothesis (not confirmed — needs Windows-side verification)
 
