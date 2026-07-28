@@ -11,6 +11,7 @@ import './agents.js';
 import './self-mod.js';
 import './web-tools.js';
 import './delegate.js';
+import './crm.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
