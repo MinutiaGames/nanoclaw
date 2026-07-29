@@ -146,6 +146,61 @@ export function isPrivateOrLoopbackIPv6(ip: string): boolean {
   return lower === '::1' || lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd');
 }
 
+// --- Low-quality research source guard ----------------------------------
+// Distinct from the SSRF guard above (that's about network safety; this is
+// about data quality) — people-search/background-check aggregators show
+// paywalled, masked placeholder data to non-subscribers, not real facts.
+// Confirmed live: a fetch of a Spokeo profile page returned a phone number
+// with letters in it ("(908) 839-NBNR") and a nonsense email, both
+// formatted to look plausible at a glance. An agent has no way to tell
+// that's fake from the page content alone, so it's blocked at the fetch
+// layer instead of left to a downstream consumer to distrust — this way no
+// agent group can be fooled by this class of page, regardless of task.
+// Keep this in sync with leadgen-crm's lib/low-quality-sources.ts
+// (a separate repo/codebase, so duplicated rather than shared) — grow both
+// as new ones show up in practice.
+const LOW_QUALITY_RESEARCH_HOSTNAMES = [
+  'whitepages.com',
+  'radaris.com',
+  'contactout.com',
+  'spokeo.com',
+  'beenverified.com',
+  'truepeoplesearch.com',
+  'fastpeoplesearch.com',
+  'peoplefinders.com',
+  'intelius.com',
+  'mylife.com',
+  'checkpeople.com',
+  'familytreenow.com',
+  'thatsthem.com',
+  'peekyou.com',
+  'usphonebook.com',
+  'zabasearch.com',
+  'nuwber.com',
+  'cyberbackgroundchecks.com',
+  'instantcheckmate.com',
+  'truthfinder.com',
+  'peoplelooker.com',
+  'searchpeoplefree.com',
+  'voterrecords.com',
+];
+
+export function isLowQualityResearchHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return LOW_QUALITY_RESEARCH_HOSTNAMES.some((marker) => lower === marker || lower.endsWith(`.${marker}`));
+}
+
+async function assertFetchableUrl(rawUrl: string): Promise<{ error: string } | { url: URL }> {
+  const publicCheck = await assertPublicUrl(rawUrl);
+  if ('error' in publicCheck) return publicCheck;
+  if (isLowQualityResearchHost(publicCheck.url.hostname)) {
+    return {
+      error: `Refusing to fetch ${publicCheck.url.hostname} — this is a paywalled people-search/background-check aggregator. What it shows non-subscribers is masked placeholder data (fake-looking phone numbers and emails), not real facts about anyone. Find a different source instead of retrying this one.`,
+    };
+  }
+  return publicCheck;
+}
+
 export async function assertPublicUrl(rawUrl: string): Promise<{ error: string } | { url: URL }> {
   let url: URL;
   try {
@@ -262,10 +317,10 @@ export async function performWebFetch(rawUrl: string, maxChars: number): Promise
   if (!trimmed) return { error: 'url is required' };
   const capped = Math.min(Math.max(maxChars || 5000, 500), 20_000);
 
-  const check = await assertPublicUrl(trimmed);
+  const check = await assertFetchableUrl(trimmed);
   if ('error' in check) return { error: check.error };
 
-  const fetched = await fetchFollowingRedirects(check.url, FETCH_TIMEOUT_MS);
+  const fetched = await fetchFollowingRedirects(check.url, FETCH_TIMEOUT_MS, assertFetchableUrl);
   if ('error' in fetched) return { error: fetched.error };
   const { res } = fetched;
   if (!res.ok) return { error: `Fetch returned HTTP ${res.status}` };
