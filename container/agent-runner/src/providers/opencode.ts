@@ -106,7 +106,7 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
   return out;
 }
 
-function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
+export function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
@@ -150,7 +150,19 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
     enabled_providers: [provider],
-    permission: 'allow',
+    // OpenCode's own built-in `webfetch` and `task` tools sit alongside
+    // whatever we register via MCP, unnamespaced and invisible to this
+    // codebase's guardrails (SSRF guard, low-quality-source block, the
+    // LinkedIn /in/ block) — confirmed live: a local model called bare
+    // `webfetch` instead of our `nanoclaw_web_fetch` and fetched an
+    // unvalidated URL straight through, and `task` spun up a subagent with
+    // its own independent tool access. Denied outright rather than left
+    // available — this pipeline's research path is `nanoclaw_web_search` /
+    // `nanoclaw_web_fetch` only. Wildcard preserves the prior blanket-allow
+    // (needed since this runs headlessly, nothing to answer an "ask"
+    // prompt) for every other built-in (bash, edit, read, etc.) and our MCP
+    // tools; specific keys take precedence over the wildcard.
+    permission: { '*': 'allow', webfetch: 'deny', task: 'deny' },
     autoupdate: false,
     snapshot: false,
     provider: providerOptions,

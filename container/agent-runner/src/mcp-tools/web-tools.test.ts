@@ -10,6 +10,7 @@ import {
   isPrivateOrLoopbackIPv6,
   parseCookiePair,
   parseDuckDuckGoResults,
+  performWebFetch,
 } from './web-tools.js';
 
 describe('parseDuckDuckGoResults', () => {
@@ -157,6 +158,35 @@ describe('assertPublicUrl', () => {
   test('allows a real public domain', async () => {
     const result = await assertPublicUrl('https://example.com/page');
     expect('url' in result).toBe(true);
+  });
+});
+
+describe('performWebFetch — LinkedIn personal-profile guard', () => {
+  test('refuses linkedin.com/in/... without making a network request', async () => {
+    const result = await performWebFetch('https://www.linkedin.com/in/jane-doe-cpa-12345', 5000);
+    expect('error' in result).toBe(true);
+    if ('error' in result) {
+      expect(result.error).toContain('login wall');
+      expect(result.error).toContain('company');
+    }
+  });
+
+  test('does not refuse linkedin.com/company/...', async () => {
+    // No live network access in the test sandbox, so this exercises the
+    // guard check only (it should NOT return the /in/ refusal message) —
+    // whatever happens past that point is a real fetch attempt, which will
+    // itself fail offline, but with a different error than the guard's.
+    const result = await performWebFetch('https://www.linkedin.com/company/example', 5000);
+    if ('error' in result) {
+      expect(result.error).not.toContain('login wall');
+    }
+  });
+
+  test('bare linkedin.com root is not blocked by the /in/ guard', async () => {
+    const result = await performWebFetch('https://linkedin.com/', 5000);
+    if ('error' in result) {
+      expect(result.error).not.toContain('login wall');
+    }
   });
 });
 

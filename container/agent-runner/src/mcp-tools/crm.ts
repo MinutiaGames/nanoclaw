@@ -67,7 +67,7 @@ export const crmGetNextProspect: McpToolDefinition = {
   tool: {
     name: 'crm_get_next_prospect',
     description:
-      "Get one prospect from the lead-gen CRM that hasn't been researched yet (status 'new'). Returns their name, address, license info, and any existing signals — this is real, already-verified contact data, not something to guess at. Use web_search/web_fetch (or delegate_web_research) to research this specific person/firm by name and location, then call crm_enrich_contact with what you find. If it returns no contact, the queue is empty — say so, don't invent one.\n\nDon't bother fetching people-search/background-check sites (Whitepages, Radaris, Spokeo, ContactOut, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — web_fetch refuses these domains outright, and even if it didn't, what they show non-subscribers is paywalled placeholder data, not real contact info (confirmed: a real fetch of a Spokeo page returned a phone number with letters in it and a nonsense email — garbage, not a real person's real info, just formatted to look plausible at a glance). Time spent on these is time not spent finding an actual source.\n\nIF THE NAME YOU FIND DOESN'T MATCH: a web search will sometimes turn up someone with a different surname in the same city/practice area (e.g. CRM says \"Peters\", search turns up a \"Trickey\" at a firm in the same town) — do NOT assume these are the same person just because the first name, city, or general practice area line up. Verify using the `license_number` this tool already gave you: look it up at the relevant state's official license/board lookup (Florida's is myfloridalicense.com/LicenseDetail.asp?id=<license_number> — confirmed working) and check what primary name that license currently shows. A real name change (marriage, etc.) will show up there under the SAME license number — that's a confirmed match, go ahead and use the new name. If you can't confirm it that way, don't assert they're the same person: either skip the mismatched info or save it with confidence \"low\" and a note explicitly flagging the unverified name mismatch, so a human knows to check it rather than assuming it's solid.",
+      "Get one prospect from the lead-gen CRM that hasn't been researched yet (status 'new'). Returns their name, address, license info, and any existing signals — this is real, already-verified contact data, not something to guess at. Use web_search/web_fetch (or delegate_web_research) to research this specific person/firm by name and location, then call crm_enrich_contact with what you find. If it returns no contact, the queue is empty — say so, don't invent one. Use `max_years_licensed` if your instructions specify a threshold — over 40,000 contacts are in the CRM and most aren't worth enriching yet, so narrowing by recency-of-license is how the pool gets prioritized instead of picking a purely random contact.\n\nDon't bother fetching people-search/background-check sites (Whitepages, Radaris, Spokeo, ContactOut, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — web_fetch refuses these domains outright, and even if it didn't, what they show non-subscribers is paywalled placeholder data, not real contact info (confirmed: a real fetch of a Spokeo page returned a phone number with letters in it and a nonsense email — garbage, not a real person's real info, just formatted to look plausible at a glance). Time spent on these is time not spent finding an actual source.\n\nIF THE NAME YOU FIND DOESN'T MATCH: a web search will sometimes turn up someone with a different surname in the same city/practice area (e.g. CRM says \"Peters\", search turns up a \"Trickey\" at a firm in the same town) — do NOT assume these are the same person just because the first name, city, or general practice area line up. Verify using the `license_number` this tool already gave you: look it up at the relevant state's official license/board lookup (Florida's is myfloridalicense.com/LicenseDetail.asp?id=<license_number> — confirmed working) and check what primary name that license currently shows. A real name change (marriage, etc.) will show up there under the SAME license number — that's a confirmed match, go ahead and use the new name. If you can't confirm it that way, don't assert they're the same person: either skip the mismatched info or save it with confidence \"low\" and a note explicitly flagging the unverified name mismatch, so a human knows to check it rather than assuming it's solid.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -80,6 +80,11 @@ export const crmGetNextProspect: McpToolDefinition = {
           type: 'string',
           description: "Restrict to this subtype, e.g. 'cpa_individual', 'cpa_firm'. Omit for any.",
         },
+        max_years_licensed: {
+          type: 'integer',
+          description:
+            'Only return a prospect licensed this many years or fewer. Newer licensees are the current priority — check the system prompt / your instructions for the current threshold rather than guessing one.',
+        },
       },
     },
   },
@@ -87,6 +92,7 @@ export const crmGetNextProspect: McpToolDefinition = {
     const params = new URLSearchParams();
     if (args.contact_type) params.set('contact_type', String(args.contact_type));
     if (args.contact_subtype) params.set('contact_subtype', String(args.contact_subtype));
+    if (args.max_years_licensed !== undefined) params.set('max_years_licensed', String(args.max_years_licensed));
 
     const result = await crmFetch(`/api/contacts/next?${params.toString()}`);
     if ('error' in result) return err(result.error);

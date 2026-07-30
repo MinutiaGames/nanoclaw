@@ -190,12 +190,34 @@ export function isLowQualityResearchHost(hostname: string): boolean {
   return LOW_QUALITY_RESEARCH_HOSTNAMES.some((marker) => lower === marker || lower.endsWith(`.${marker}`));
 }
 
+// --- LinkedIn personal-profile guard -------------------------------------
+// Distinct from the low-quality-host list above — LinkedIn itself is a good
+// source, but a bare/unauthenticated fetch of a /in/ personal-profile page
+// almost always hits its anti-bot wall: either a login-gated stub ("Sign in
+// to view X's full profile") or an outright HTTP 999. Confirmed live across
+// many enrichment runs — every /in/ fetch attempted has hit one of the two.
+// Company pages (/company/...) are NOT walled the same way and have
+// returned real About/website/employee data live, so only /in/ is blocked
+// here — the search-result snippet for a profile URL usually already
+// surfaces the useful bio text without needing the page itself.
+function isLinkedInProfilePath(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase();
+  if (hostname !== 'linkedin.com' && !hostname.endsWith('.linkedin.com')) return false;
+  return url.pathname.startsWith('/in/');
+}
+
 async function assertFetchableUrl(rawUrl: string): Promise<{ error: string } | { url: URL }> {
   const publicCheck = await assertPublicUrl(rawUrl);
   if ('error' in publicCheck) return publicCheck;
   if (isLowQualityResearchHost(publicCheck.url.hostname)) {
     return {
       error: `Refusing to fetch ${publicCheck.url.hostname} — this is a paywalled people-search/background-check aggregator. What it shows non-subscribers is masked placeholder data (fake-looking phone numbers and emails), not real facts about anyone. Find a different source instead of retrying this one.`,
+    };
+  }
+  if (isLinkedInProfilePath(publicCheck.url)) {
+    return {
+      error:
+        'Refusing to fetch a LinkedIn personal-profile URL (/in/...) — an unauthenticated fetch always hits a login wall or an anti-bot block, never real content. Use the snippet text web_search already returned for this URL instead (it usually has the useful bio/title/company info); do not retry this fetch. LinkedIn company pages (linkedin.com/company/...) are not blocked and are fine to fetch.',
     };
   }
   return publicCheck;
@@ -375,7 +397,7 @@ export const webFetch: McpToolDefinition = {
   tool: {
     name: 'web_fetch',
     description:
-      'Fetch a specific URL and return its readable text plus any email addresses and phone numbers found on the page. Use after web_search to read a page it returned. Cannot execute JavaScript — for pages that require it, fall back to agent-browser.',
+      'Fetch a specific URL and return its readable text plus any email addresses and phone numbers found on the page. Use after web_search to read a page it returned. Cannot execute JavaScript — for pages that require it, fall back to agent-browser. Refuses linkedin.com/in/... personal-profile URLs outright (they always hit a login wall) — use the web_search snippet for those instead; linkedin.com/company/... pages are not blocked.',
     inputSchema: {
       type: 'object' as const,
       properties: {
