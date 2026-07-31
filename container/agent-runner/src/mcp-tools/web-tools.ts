@@ -18,10 +18,13 @@
  * limit. But a follow-up batch the same day (2026-07-31) showed EVERY
  * configured engine accumulating blocks under enough same-day volume, not
  * just DuckDuckGo — engine diversity alone has a ceiling. SearXNG stays
- * primary (free, usually enough); once it misses SEARXNG_FAILURE_THRESHOLD
- * times in a row, web_search falls over to Serper (paid, google.serper.dev)
- * for the rest of that run — see the const block below for the breaker's
- * exact shape and why it's a simple in-process latch, not persisted state.
+ * primary (free, usually enough) and is tried on every single call, never
+ * permanently given up on within a run; once it's missed
+ * SEARXNG_FAILURE_THRESHOLD times in a row, that specific call ALSO tries
+ * Serper (paid, google.serper.dev) as a rescue, but the very next call
+ * tries SearXNG again fresh — see the const block below for why per-turn
+ * beats a sticky trip-for-the-rest-of-the-run latch (an earlier version
+ * did that and overpaid for Serper once SearXNG had already recovered).
  * web_fetch retrieves a specific URL and returns cleaned readable text plus
  * regex-extracted emails/phone numbers, since that's the exact shape the
  * lead-gen use case needs (contact info off a firm's site) and a small
@@ -72,25 +75,37 @@ const SEARXNG_BASE_URL = process.env.SEARXNG_BASE_URL || 'http://172.27.29.246:8
 // performWebSearch degrades to exactly its pre-Serper behavior.
 const SERPER_URL = 'https://google.serper.dev/search';
 
-// "fails a few times" (user's framing) → 3 consecutive SearXNG misses (empty
-// results or unreachable) trips the breaker. Deliberately a plain in-memory
-// module counter, not persisted anywhere: the agent-runner process is
-// per-run (one CRM enrichment run per container, session-wiped between
-// runs — see run-bakeoff-test.sh), so it naturally resets every run. A
-// SearXNG outage lasting one run doesn't need to be remembered into the
-// next one; the next run just re-learns it within its own first 3 misses.
-// Once tripped, stays tripped for the rest of this process's life — no
-// half-open retry — because a real block (confirmed: Startpage got a
-// 3600s suspension on 2026-07-31) won't clear mid-run, so re-probing
-// SearXNG on every subsequent call would just waste a request each time.
+// "fails a few times" (user's framing) → SearXNG is tried on EVERY call, no
+// exceptions — it never gets permanently given up on within a run. A
+// rolling counter of consecutive misses (empty results or unreachable)
+// decides, per call, whether to ALSO try Serper as a rescue once that
+// count reaches the threshold. The moment SearXNG succeeds again the
+// counter resets and Serper stops being called — no separate "recovery"
+// step needed, since SearXNG was never skipped in the first place.
+// Deliberately per-turn, not a sticky trip-for-the-rest-of-the-run latch:
+// an earlier version latched permanently once tripped, but that meant one
+// bad patch of 3 misses would keep paying for Serper for a run's remaining
+// searches even if SearXNG recovered on the very next call. Always
+// re-probing costs one extra (usually fast, ~1-2s) SearXNG request per
+// miss while degraded, which is worth it to never overpay once healthy
+// again. Plain in-memory module counter, not persisted across runs: the
+// agent-runner process is per-run (one CRM enrichment run per container —
+// see run-bakeoff-test.sh), so it naturally starts fresh every run anyway.
 const SEARXNG_FAILURE_THRESHOLD = 3;
 let searxngConsecutiveFailures = 0;
-let searxngTripped = false;
 
-/** Test-only: this module's breaker state is otherwise process-lifetime, which would leak between test cases. */
+// Distinct from the SearXNG counter above and NOT per-turn on purpose: a
+// missing/invalid vault secret (HTTP 403, confirmed live) is a static
+// config fact for this run, unlike SearXNG's blocks which can clear
+// mid-run — so once we see it, there's nothing to gain by paying the
+// latency of re-probing Serper on every subsequent miss in this run too.
+// Still re-checked fresh on the next run (new process, new container).
+let serperKnownUnconfigured = false;
+
+/** Test-only: this module's state is otherwise process-lifetime, which would leak between test cases. */
 export function __resetSearxngBreakerForTests(): void {
   searxngConsecutiveFailures = 0;
-  searxngTripped = false;
+  serperKnownUnconfigured = false;
 }
 
 // --- Manual redirect handling with a cookie jar ------------------------
@@ -410,13 +425,16 @@ export async function trySearxng(
 
 // No auth header set here on purpose — the OneCLI gateway injects X-API-KEY
 // for requests to this host once a vault secret exists (see the const's
-// comment above). Until then this 401s and performWebSearch falls through
-// to reporting search as unavailable, same as if Serper were never wired.
+// comment above). Until then this comes back 403 (confirmed live against
+// the real endpoint with no key and with a garbage key — Serper uses 403
+// for both missing and invalid credentials, not 401) and performWebSearch
+// falls through to reporting search as unavailable, same as if Serper were
+// never wired.
 export async function trySerper(
   query: string,
   maxResults: number,
   url: string = SERPER_URL,
-): Promise<{ results: SearchResult[] } | { error: string }> {
+): Promise<{ results: SearchResult[] } | { error: string; unconfigured?: boolean }> {
   let res: Response;
   try {
     res = await fetch(url, {
@@ -428,7 +446,8 @@ export async function trySerper(
   } catch (e) {
     return { error: `could not reach Serper (${e instanceof Error ? e.message : String(e)})` };
   }
-  if (!res.ok) return { error: `Serper returned HTTP ${res.status} (no vault secret configured yet for its host?)` };
+  if (res.status === 403) return { error: 'Serper returned HTTP 403 (no vault secret configured yet)', unconfigured: true };
+  if (!res.ok) return { error: `Serper returned HTTP ${res.status}` };
   const body = await res.json().catch(() => null);
   return { results: parseSerperResults(body, maxResults) };
 }
@@ -442,26 +461,32 @@ export async function performWebSearch(
   if (!trimmed) return { error: 'query is required' };
   const capped = Math.min(Math.max(maxResults || 5, 1), 15);
 
-  if (!searxngTripped) {
-    const searxng = await trySearxng(trimmed, capped, opts.searxngBaseUrl);
-    if ('results' in searxng && searxng.results.length > 0) {
-      searxngConsecutiveFailures = 0;
-      log(`web_search (searxng): "${trimmed}" -> ${searxng.results.length} result(s)`);
-      return { text: formatSearchResults(searxng.results) };
-    }
-
-    searxngConsecutiveFailures++;
-    const reason = 'error' in searxng ? searxng.error : 'zero results';
-    log(`web_search: SearXNG miss ${searxngConsecutiveFailures}/${SEARXNG_FAILURE_THRESHOLD} (${reason})`);
-    if (searxngConsecutiveFailures < SEARXNG_FAILURE_THRESHOLD) {
-      return { text: 'No results for this query — try rephrasing or broadening it.' };
-    }
-    searxngTripped = true;
-    log(`web_search: SearXNG hit ${SEARXNG_FAILURE_THRESHOLD} consecutive misses — switching to the Serper fallback for the rest of this run`);
+  const searxng = await trySearxng(trimmed, capped, opts.searxngBaseUrl);
+  if ('results' in searxng && searxng.results.length > 0) {
+    searxngConsecutiveFailures = 0;
+    log(`web_search (searxng): "${trimmed}" -> ${searxng.results.length} result(s)`);
+    return { text: formatSearchResults(searxng.results) };
   }
 
+  searxngConsecutiveFailures++;
+  const reason = 'error' in searxng ? searxng.error : 'zero results';
+  log(`web_search: SearXNG miss ${searxngConsecutiveFailures} in a row (${reason})`);
+  if (searxngConsecutiveFailures < SEARXNG_FAILURE_THRESHOLD) {
+    return { text: 'No results for this query — try rephrasing or broadening it.' };
+  }
+
+  if (serperKnownUnconfigured) {
+    log(`web_search: SearXNG has missed ${searxngConsecutiveFailures} times in a row — skipping Serper (already confirmed unconfigured this run)`);
+    return {
+      error:
+        'Both SearXNG and the Serper fallback are unavailable right now. Do not fall back to guessing — report that search is unavailable.',
+    };
+  }
+
+  log(`web_search: SearXNG has missed ${searxngConsecutiveFailures} times in a row — trying the Serper fallback for this search (will try SearXNG again on the next one)`);
   const serper = await trySerper(trimmed, capped, opts.serperUrl);
   if ('error' in serper) {
+    if (serper.unconfigured) serperKnownUnconfigured = true;
     log(`web_search: Serper fallback also failed (${serper.error})`);
     return {
       error:

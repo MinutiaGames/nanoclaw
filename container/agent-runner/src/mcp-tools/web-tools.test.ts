@@ -98,7 +98,7 @@ describe('parseSerperResults', () => {
   });
 });
 
-describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () => {
+describe('performWebSearch — SearXNG-primary / Serper-fallback, per-turn', () => {
   let searxngServer: ReturnType<typeof Bun.serve> | null = null;
   let serperServer: ReturnType<typeof Bun.serve> | null = null;
 
@@ -142,15 +142,15 @@ describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () =>
     expect(searxng.hits()).toBe(1);
   });
 
-  test('two SearXNG misses (below threshold 3) do not trip the breaker', async () => {
+  test('two SearXNG misses (below threshold 3) never call Serper', async () => {
     const searxng = startFakeSearxng([]); // always empty
-    await performWebSearch('q1', 5, { searxngBaseUrl: searxng.url });
-    const second = await performWebSearch('q2', 5, { searxngBaseUrl: searxng.url });
+    await performWebSearch('q1', 5, { searxngBaseUrl: searxng.url, serperUrl: 'http://127.0.0.1:1' });
+    const second = await performWebSearch('q2', 5, { searxngBaseUrl: searxng.url, serperUrl: 'http://127.0.0.1:1' });
     expect('text' in second && second.text).toContain('No results');
-    expect(searxng.hits()).toBe(2); // both calls hit SearXNG — not tripped yet
+    expect(searxng.hits()).toBe(2);
   });
 
-  test('third consecutive SearXNG miss trips the breaker and falls to Serper', async () => {
+  test('third consecutive SearXNG miss ALSO tries Serper as a rescue for that call', async () => {
     const searxng = startFakeSearxng([]); // always empty -> 3 misses
     const serper = startFakeSerper([{ title: 'From Serper', link: 'https://example.com/serper', snippet: 'Found via fallback.' }]);
     await performWebSearch('q1', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
@@ -161,26 +161,31 @@ describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () =>
     expect(serper.hits()).toBe(1);
   });
 
-  test('once tripped, stays on Serper for the rest of the run — never re-probes SearXNG', async () => {
-    const searxng = startFakeSearxng([]);
+  test('per-turn, not sticky: the very next call after a Serper rescue tries SearXNG again, and uses it if it succeeds', async () => {
+    const searxng = startFakeSearxng([]); // starts always-empty
     const serper = startFakeSerper([{ title: 'From Serper', link: 'https://example.com/serper', snippet: 'x' }]);
     for (let i = 0; i < 3; i++) await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
     expect(searxng.hits()).toBe(3);
+    expect(serper.hits()).toBe(1);
 
-    const fourth = await performWebSearch('q4', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
-    expect('text' in fourth && fourth.text).toContain('From Serper');
-    expect(searxng.hits()).toBe(3); // unchanged — the 4th call skipped SearXNG entirely
-    expect(serper.hits()).toBe(2);
+    // SearXNG "recovers" for the 4th call — performWebSearch must still be
+    // trying it (not skipping straight to Serper because of the earlier miss streak).
+    searxngServer?.stop(true);
+    const recovered = startFakeSearxng([{ title: 'Recovered', url: 'https://x.com', content: 'x' }]);
+    const fourth = await performWebSearch('q4', 5, { searxngBaseUrl: recovered.url, serperUrl: serper.url });
+    expect('text' in fourth && fourth.text).toContain('Recovered');
+    expect(recovered.hits()).toBe(1); // SearXNG WAS tried on this call
+    expect(serper.hits()).toBe(1); // unchanged — Serper wasn't needed once SearXNG succeeded
   });
 
-  test('a SearXNG success resets the miss counter', async () => {
+  test('a SearXNG success resets the miss counter, so a later streak needs its own 3 misses', async () => {
     let call = 0;
     searxngServer = Bun.serve({
       port: 0,
       fetch() {
         call++;
-        // miss, miss, HIT, miss, miss, miss -> should take 3 misses *after* the
-        // reset to trip, i.e. 6 total calls, not trip on the 5th (2+3).
+        // miss, miss, HIT, miss, miss, miss -> reaches the threshold only on
+        // the 6th call (3 fresh misses after the reset), not the 5th (2+3).
         return call === 3 ? Response.json({ results: [{ title: 'Recovered', url: 'https://x.com', content: 'x' }] }) : Response.json({ results: [] });
       },
     });
@@ -194,13 +199,13 @@ describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () =>
 
     await performWebSearch('q4', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 1 (post-reset)
     await performWebSearch('q5', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 2 (post-reset)
-    expect(serper.hits()).toBe(0); // not tripped yet — only 2 misses since the reset
-    const sixth = await performWebSearch('q6', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 3 -> trip
+    expect(serper.hits()).toBe(0); // threshold not reached yet — only 2 misses since the reset
+    const sixth = await performWebSearch('q6', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 3 -> reaches threshold
     expect('text' in sixth && sixth.text).toContain('From Serper');
     expect(serper.hits()).toBe(1);
   });
 
-  test('tripped + Serper also fails -> returns an error, not a misleading "no results"', async () => {
+  test('threshold reached + Serper also fails -> returns an error, not a misleading "no results"', async () => {
     const searxng = startFakeSearxng([]);
     for (let i = 0; i < 3; i++) {
       await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url, serperUrl: 'http://127.0.0.1:1' });
@@ -209,7 +214,7 @@ describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () =>
     expect('error' in result).toBe(true);
   });
 
-  test('tripped + Serper reachable but genuinely empty -> "no results", not an error', async () => {
+  test('threshold reached + Serper reachable but genuinely empty -> "no results", not an error', async () => {
     const searxng = startFakeSearxng([]);
     const serper = startFakeSerper([]);
     for (let i = 0; i < 3; i++) {
@@ -217,6 +222,22 @@ describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () =>
     }
     const result = await performWebSearch('q4', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
     expect('text' in result && result.text).toContain('No results');
+  });
+
+  test('a 403 from Serper (no vault secret yet) is remembered — later misses in the same run skip calling it', async () => {
+    const searxng = startFakeSearxng([]); // always empty
+    let serperHits = 0;
+    serperServer = Bun.serve({ port: 0, fetch: () => (serperHits++, new Response('forbidden', { status: 403 })) });
+    const serperUrl = `http://localhost:${serperServer.port}`;
+
+    for (let i = 0; i < 3; i++) await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url, serperUrl }); // reaches threshold -> 1 Serper call, sees 403
+    expect(serperHits).toBe(1);
+
+    // Two more misses in the same run — Serper should NOT be called again.
+    await performWebSearch('q4', 5, { searxngBaseUrl: searxng.url, serperUrl });
+    const result = await performWebSearch('q5', 5, { searxngBaseUrl: searxng.url, serperUrl });
+    expect(serperHits).toBe(1); // unchanged
+    expect('error' in result).toBe(true); // still reports unavailable, just without the wasted request
   });
 });
 
