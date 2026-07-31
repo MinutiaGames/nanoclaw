@@ -9,34 +9,31 @@ import {
   isPrivateOrLoopbackIPv4,
   isPrivateOrLoopbackIPv6,
   parseCookiePair,
-  parseDuckDuckGoResults,
+  parseSearxngResults,
   performWebFetch,
 } from './web-tools.js';
 
-describe('parseDuckDuckGoResults', () => {
-  const SAMPLE_HTML = `
-    <div class="results">
-      <div class="result results_links results_links_deep web-result">
-        <div class="links_main links_deep result__body">
-          <h2 class="result__title">
-            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fjane-doe-cpa&amp;rut=abc">Jane Doe CPA &amp; Associates</a>
-          </h2>
-          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fjane-doe-cpa">Certified public accountant serving the metro area. <b>Call</b> today.</a>
-        </div>
-      </div>
-      <div class="result results_links results_links_deep web-result">
-        <div class="links_main links_deep result__body">
-          <h2 class="result__title">
-            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fsmith-tax">Smith Tax &amp; Bookkeeping</a>
-          </h2>
-          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fsmith-tax">Full-service tax prep.</a>
-        </div>
-      </div>
-    </div>
-  `;
+describe('parseSearxngResults', () => {
+  const SAMPLE_RESPONSE = {
+    query: 'jane doe cpa',
+    results: [
+      {
+        title: 'Jane Doe CPA & Associates',
+        url: 'https://example.com/jane-doe-cpa',
+        content: 'Certified public accountant serving the metro area. Call today.',
+        engines: ['duckduckgo', 'brave'],
+      },
+      {
+        title: 'Smith Tax & Bookkeeping',
+        url: 'https://example.org/smith-tax',
+        content: 'Full-service tax prep.',
+        engines: ['mojeek'],
+      },
+    ],
+  };
 
-  test('extracts title, unwrapped url, and snippet', () => {
-    const results = parseDuckDuckGoResults(SAMPLE_HTML, 5);
+  test('extracts title, url, and snippet', () => {
+    const results = parseSearxngResults(SAMPLE_RESPONSE, 5);
     expect(results).toHaveLength(2);
     expect(results[0].title).toBe('Jane Doe CPA & Associates');
     expect(results[0].url).toBe('https://example.com/jane-doe-cpa');
@@ -44,11 +41,21 @@ describe('parseDuckDuckGoResults', () => {
   });
 
   test('respects maxResults', () => {
-    expect(parseDuckDuckGoResults(SAMPLE_HTML, 1)).toHaveLength(1);
+    expect(parseSearxngResults(SAMPLE_RESPONSE, 1)).toHaveLength(1);
   });
 
-  test('empty/garbage html returns no results', () => {
-    expect(parseDuckDuckGoResults('<html><body>nothing here</body></html>', 5)).toHaveLength(0);
+  test('skips entries missing a title or url', () => {
+    const results = parseSearxngResults(
+      { results: [{ title: '', url: 'https://example.com', content: 'x' }, { title: 'No URL', content: 'x' }] },
+      5,
+    );
+    expect(results).toHaveLength(0);
+  });
+
+  test('non-array/missing results returns no results', () => {
+    expect(parseSearxngResults({}, 5)).toHaveLength(0);
+    expect(parseSearxngResults(null, 5)).toHaveLength(0);
+    expect(parseSearxngResults({ results: 'nope' }, 5)).toHaveLength(0);
   });
 });
 

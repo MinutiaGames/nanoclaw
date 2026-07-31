@@ -1,0 +1,41 @@
+use_default_settings: true
+
+general:
+  instance_name: "nanoclaw-local"
+
+# Local, single-caller instance (the CRM enrichment pipeline's web_search
+# tool) — not exposed past this machine, so the public-instance abuse
+# protections (rate limiting, bot detection) that a shared instance needs
+# would just get in our own way here.
+server:
+  # Signs preference cookies / CSRF tokens for this Flask app — not an API
+  # credential, and this instance has no user accounts or sensitive data
+  # behind it, so the blast radius of it leaking is low. Tracked in git
+  # (not .env-style gitignored) by deliberate choice. The current image
+  # hard-refuses to start on the stock "ultrasecretkey" placeholder
+  # (confirmed live, 2026.7.31 build) rather than auto-generating one, so
+  # this has to be a real value, not a template placeholder.
+  secret_key: "5c3889627a0075e5a3f2337bbb6cd5cf5e56dd8ec4ad076ee2927efc7e48ee84"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+# No-API-key engines only — the point of this instance is resilience via
+# engine diversity when any single one (confirmed: DuckDuckGo) starts
+# rate-limiting, without taking on a paid API key anywhere.
+engines:
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: startpage
+    disabled: false
+  - name: qwant
+    disabled: false

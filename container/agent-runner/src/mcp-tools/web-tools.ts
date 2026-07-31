@@ -4,14 +4,24 @@
  * native `websearch` requires OPENCODE_ENABLE_EXA=true and calls out to
  * Exa's cloud service — a departure from the local-only setup). Both tools
  * here run entirely inside the container: fetch + parse, no third-party
- * search backend, full control over sanitization and error handling.
+ * cloud search backend, full control over sanitization and error handling.
  *
- * web_search scrapes DuckDuckGo's non-JS HTML results page (no API key,
- * stable-ish markup). web_fetch retrieves a specific URL and returns
- * cleaned readable text plus regex-extracted emails/phone numbers, since
- * that's the exact shape the lead-gen use case needs (contact info off a
- * firm's site) and a small local model doing that extraction itself by eye
- * is slower and less reliable than deterministic regex.
+ * web_search queries a self-hosted SearXNG instance (see `searxng/` at repo
+ * root) rather than scraping DuckDuckGo's HTML results page directly, which
+ * this originally did. Under sustained batch volume (a 100-run overnight
+ * CRM enrichment batch, 2026-07-30) DDG started blocking/rate-limiting the
+ * large majority of requests — confirmed via the per-run tool-call
+ * trajectory logs, not an assumption. SearXNG fans one query out to several
+ * no-API-key engines (DuckDuckGo, Brave, Startpage, Mojeek, Qwant) in
+ * parallel and merges the results, so one engine blocking no longer sinks
+ * search entirely — each engine has its own independent rate limit.
+ * web_fetch retrieves a specific URL and returns cleaned readable text plus
+ * regex-extracted emails/phone numbers, since that's the exact shape the
+ * lead-gen use case needs (contact info off a firm's site) and a small
+ * local model doing that extraction itself by eye is slower and less
+ * reliable than deterministic regex. web_fetch is unaffected by the DDG
+ * issue — it's a direct fetch of a URL search already returned, not a
+ * search itself.
  */
 import { lookup as dnsLookup } from 'dns/promises';
 
@@ -37,6 +47,13 @@ const MAX_RESPONSE_BYTES = 5_000_000; // 5MB cap — plenty for a directory/prof
 const MAX_REDIRECTS = 10;
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+
+// Same reachability pattern as the CRM tool (crm.ts): the SearXNG container
+// runs on this same WSL2 distro's own network namespace, which
+// host.docker.internal does not route back into — the distro's own eth0 IP
+// is directly reachable from containers instead. That IP can change on a
+// WSL2 restart; override with SEARXNG_BASE_URL if it stops connecting.
+const SEARXNG_BASE_URL = process.env.SEARXNG_BASE_URL || 'http://172.27.29.246:8080';
 
 // --- Manual redirect handling with a cookie jar ------------------------
 // Browser fetch() has an implicit cookie jar (the browser owns one);
@@ -251,7 +268,11 @@ export async function assertPublicUrl(rawUrl: string): Promise<{ error: string }
   return { url };
 }
 
-// --- DuckDuckGo HTML result parsing ------------------------------------
+// --- SearXNG result parsing ---------------------------------------------
+// SearXNG's /search?format=json returns { results: [{ title, url, content,
+// engines, score, ... }, ...] } — already-structured JSON, no HTML scraping
+// needed (unlike the old direct-DDG approach this replaced). Parsing is
+// deliberately defensive about shape since it's a third-party response body.
 
 export interface SearchResult {
   title: string;
@@ -259,30 +280,21 @@ export interface SearchResult {
   snippet: string;
 }
 
-/** Unwrap DDG's `//duckduckgo.com/l/?uddg=<encoded-real-url>` redirect wrapper. */
-function unwrapDdgRedirect(href: string): string {
-  try {
-    const u = new URL(href, 'https://duckduckgo.com');
-    const real = u.searchParams.get('uddg');
-    return real ? decodeURIComponent(real) : href;
-  } catch {
-    return href;
-  }
-}
+export function parseSearxngResults(body: unknown, maxResults: number): SearchResult[] {
+  const results = (body as { results?: unknown } | null)?.results;
+  if (!Array.isArray(results)) return [];
 
-export function parseDuckDuckGoResults(html: string, maxResults: number): SearchResult[] {
-  const $ = cheerio.load(html);
-  const results: SearchResult[] = [];
-  $('.result').each((_, el) => {
-    if (results.length >= maxResults) return;
-    const titleEl = $(el).find('.result__a').first();
-    const title = titleEl.text().trim().replace(/\s+/g, ' ');
-    const href = titleEl.attr('href');
-    const snippet = $(el).find('.result__snippet').first().text().trim().replace(/\s+/g, ' ');
-    if (!title || !href) return;
-    results.push({ title, url: unwrapDdgRedirect(href), snippet });
-  });
-  return results;
+  const out: SearchResult[] = [];
+  for (const r of results) {
+    if (out.length >= maxResults) break;
+    const entry = r as { title?: unknown; url?: unknown; content?: unknown };
+    const title = typeof entry.title === 'string' ? entry.title.trim() : '';
+    const url = typeof entry.url === 'string' ? entry.url.trim() : '';
+    const snippet = typeof entry.content === 'string' ? entry.content.trim() : '';
+    if (!title || !url) continue;
+    out.push({ title, url, snippet });
+  }
+  return out;
 }
 
 // --- Readable text + contact extraction --------------------------------
@@ -316,20 +328,24 @@ export async function performWebSearch(query: string, maxResults: number): Promi
 
   let res: Response;
   try {
-    res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`, {
+    res = await fetch(`${SEARXNG_BASE_URL}/search?q=${encodeURIComponent(trimmed)}&format=json`, {
       headers: { 'User-Agent': USER_AGENT },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (e) {
-    return { error: `Search request failed: ${e instanceof Error ? e.message : String(e)}` };
+    return {
+      error:
+        `Could not reach the local SearXNG instance at ${SEARXNG_BASE_URL} (${e instanceof Error ? e.message : String(e)}). ` +
+        'It may not be running — do not fall back to guessing, report search is unavailable right now.',
+    };
   }
   if (!res.ok) return { error: `Search returned HTTP ${res.status}` };
 
-  const html = await res.text();
-  const results = parseDuckDuckGoResults(html, capped);
+  const body = await res.json().catch(() => null);
+  const results = parseSearxngResults(body, capped);
   log(`web_search: "${trimmed}" -> ${results.length} result(s)`);
   if (results.length === 0) {
-    return { text: 'No results (or DuckDuckGo blocked/rate-limited this request — try again or rephrase the query).' };
+    return { text: 'No results for this query — try rephrasing or broadening it.' };
   }
   return { text: results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n\n') };
 }
@@ -377,7 +393,7 @@ export const webSearch: McpToolDefinition = {
   tool: {
     name: 'web_search',
     description:
-      'Search the web (DuckDuckGo) and return titles, URLs, and snippets. Use to find pages worth fetching with web_fetch — this tool does not read full page content.',
+      'Search the web and return titles, URLs, and snippets. Use to find pages worth fetching with web_fetch — this tool does not read full page content.',
     inputSchema: {
       type: 'object' as const,
       properties: {
