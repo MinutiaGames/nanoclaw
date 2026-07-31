@@ -26,8 +26,21 @@ search:
     - json
 
 # No-API-key engines only — the point of this instance is resilience via
-# engine diversity when any single one (confirmed: DuckDuckGo) starts
-# rate-limiting, without taking on a paid API key anywhere.
+# engine diversity when any single one (confirmed: DuckDuckGo, then also
+# Qwant and briefly Brave/Startpage under batch volume — see the 2026-07-31
+# CAPTCHA/rate-limit findings in project memory) starts blocking, without
+# taking on a paid API key anywhere. bing/yahoo/mojeek/startpage/qwant are
+# disabled in SearXNG's own defaults and need `disabled: false` to turn on,
+# same override shape for all of them.
+#
+# "google" was tried and dropped: SearXNG's default marks it `inactive:
+# true` rather than `disabled: true`, and overriding that flag back to
+# false in this settings.yml did not actually get it invoked (confirmed:
+# zero log lines for it, unlike every other engine here which shows up
+# either succeeding or failing) — not worth chasing further given "google
+# cse" (enabled out of the box, no key needed here, no idea why — just
+# observed working) already covers Google's result set and is consistently
+# the single strongest contributor.
 engines:
   - name: duckduckgo
     disabled: false
@@ -38,4 +51,8 @@ engines:
   - name: startpage
     disabled: false
   - name: qwant
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: yahoo
     disabled: false
