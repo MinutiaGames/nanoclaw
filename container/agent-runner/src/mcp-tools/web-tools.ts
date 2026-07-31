@@ -12,9 +12,16 @@
  * CRM enrichment batch, 2026-07-30) DDG started blocking/rate-limiting the
  * large majority of requests — confirmed via the per-run tool-call
  * trajectory logs, not an assumption. SearXNG fans one query out to several
- * no-API-key engines (DuckDuckGo, Brave, Startpage, Mojeek, Qwant) in
- * parallel and merges the results, so one engine blocking no longer sinks
- * search entirely — each engine has its own independent rate limit.
+ * no-API-key engines (DuckDuckGo, Brave, Startpage, Mojeek, Qwant, Bing,
+ * Yahoo) in parallel and merges the results, so one engine blocking no
+ * longer sinks search entirely — each engine has its own independent rate
+ * limit. But a follow-up batch the same day (2026-07-31) showed EVERY
+ * configured engine accumulating blocks under enough same-day volume, not
+ * just DuckDuckGo — engine diversity alone has a ceiling. SearXNG stays
+ * primary (free, usually enough); once it misses SEARXNG_FAILURE_THRESHOLD
+ * times in a row, web_search falls over to Serper (paid, google.serper.dev)
+ * for the rest of that run — see the const block below for the breaker's
+ * exact shape and why it's a simple in-process latch, not persisted state.
  * web_fetch retrieves a specific URL and returns cleaned readable text plus
  * regex-extracted emails/phone numbers, since that's the exact shape the
  * lead-gen use case needs (contact info off a firm's site) and a small
@@ -54,6 +61,37 @@ const USER_AGENT =
 // is directly reachable from containers instead. That IP can change on a
 // WSL2 restart; override with SEARXNG_BASE_URL if it stops connecting.
 const SEARXNG_BASE_URL = process.env.SEARXNG_BASE_URL || 'http://172.27.29.246:8080';
+
+// Serper.dev — paid Google-results API, fallback only (SearXNG is primary;
+// see the 2026-07-31 project memory for why: it's free and usually enough).
+// Auth is transparent: OneCLI's egress proxy injects the X-API-KEY header
+// for requests to this host once a vault secret with a matching
+// --host-pattern exists (see docs/onecli-gateway skill) — this file never
+// sees or handles the real key. Until that secret is created, every Serper
+// call below fails closed (401/whatever the gateway lets through) and
+// performWebSearch degrades to exactly its pre-Serper behavior.
+const SERPER_URL = 'https://google.serper.dev/search';
+
+// "fails a few times" (user's framing) → 3 consecutive SearXNG misses (empty
+// results or unreachable) trips the breaker. Deliberately a plain in-memory
+// module counter, not persisted anywhere: the agent-runner process is
+// per-run (one CRM enrichment run per container, session-wiped between
+// runs — see run-bakeoff-test.sh), so it naturally resets every run. A
+// SearXNG outage lasting one run doesn't need to be remembered into the
+// next one; the next run just re-learns it within its own first 3 misses.
+// Once tripped, stays tripped for the rest of this process's life — no
+// half-open retry — because a real block (confirmed: Startpage got a
+// 3600s suspension on 2026-07-31) won't clear mid-run, so re-probing
+// SearXNG on every subsequent call would just waste a request each time.
+const SEARXNG_FAILURE_THRESHOLD = 3;
+let searxngConsecutiveFailures = 0;
+let searxngTripped = false;
+
+/** Test-only: this module's breaker state is otherwise process-lifetime, which would leak between test cases. */
+export function __resetSearxngBreakerForTests(): void {
+  searxngConsecutiveFailures = 0;
+  searxngTripped = false;
+}
 
 // --- Manual redirect handling with a cookie jar ------------------------
 // Browser fetch() has an implicit cookie jar (the browser owns one);
@@ -297,6 +335,28 @@ export function parseSearxngResults(body: unknown, maxResults: number): SearchRe
   return out;
 }
 
+// --- Serper result parsing -----------------------------------------------
+// Serper's POST /search returns { organic: [{ title, link, snippet, ... }],
+// ... } — same defensive-shape approach as parseSearxngResults since it's
+// also a third-party response body.
+
+export function parseSerperResults(body: unknown, maxResults: number): SearchResult[] {
+  const results = (body as { organic?: unknown } | null)?.organic;
+  if (!Array.isArray(results)) return [];
+
+  const out: SearchResult[] = [];
+  for (const r of results) {
+    if (out.length >= maxResults) break;
+    const entry = r as { title?: unknown; link?: unknown; snippet?: unknown };
+    const title = typeof entry.title === 'string' ? entry.title.trim() : '';
+    const url = typeof entry.link === 'string' ? entry.link.trim() : '';
+    const snippet = typeof entry.snippet === 'string' ? entry.snippet.trim() : '';
+    if (!title || !url) continue;
+    out.push({ title, url, snippet });
+  }
+  return out;
+}
+
 // --- Readable text + contact extraction --------------------------------
 
 export function htmlToReadableText(html: string, maxChars: number): string {
@@ -321,33 +381,98 @@ export function extractContacts(text: string): { emails: string[]; phones: strin
 // exact same search/fetch behavior in-process, without round-tripping
 // through the MCP protocol a second time for what's really the same tool.
 
-export async function performWebSearch(query: string, maxResults: number): Promise<{ text: string } | { error: string }> {
-  const trimmed = query?.trim();
-  if (!trimmed) return { error: 'query is required' };
-  const capped = Math.min(Math.max(maxResults || 5, 1), 15);
+function formatSearchResults(results: SearchResult[]): string {
+  return results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n\n');
+}
 
+// baseUrl/url params default to the module consts and only exist as a test
+// seam (same idiom as fetchFollowingRedirects's validateHop param below) —
+// production call sites never pass them.
+
+export async function trySearxng(
+  query: string,
+  maxResults: number,
+  baseUrl: string = SEARXNG_BASE_URL,
+): Promise<{ results: SearchResult[] } | { error: string }> {
   let res: Response;
   try {
-    res = await fetch(`${SEARXNG_BASE_URL}/search?q=${encodeURIComponent(trimmed)}&format=json`, {
+    res = await fetch(`${baseUrl}/search?q=${encodeURIComponent(query)}&format=json`, {
       headers: { 'User-Agent': USER_AGENT },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (e) {
+    return { error: `could not reach SearXNG at ${baseUrl} (${e instanceof Error ? e.message : String(e)})` };
+  }
+  if (!res.ok) return { error: `SearXNG returned HTTP ${res.status}` };
+  const body = await res.json().catch(() => null);
+  return { results: parseSearxngResults(body, maxResults) };
+}
+
+// No auth header set here on purpose — the OneCLI gateway injects X-API-KEY
+// for requests to this host once a vault secret exists (see the const's
+// comment above). Until then this 401s and performWebSearch falls through
+// to reporting search as unavailable, same as if Serper were never wired.
+export async function trySerper(
+  query: string,
+  maxResults: number,
+  url: string = SERPER_URL,
+): Promise<{ results: SearchResult[] } | { error: string }> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: query, num: maxResults }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { error: `could not reach Serper (${e instanceof Error ? e.message : String(e)})` };
+  }
+  if (!res.ok) return { error: `Serper returned HTTP ${res.status} (no vault secret configured yet for its host?)` };
+  const body = await res.json().catch(() => null);
+  return { results: parseSerperResults(body, maxResults) };
+}
+
+export async function performWebSearch(
+  query: string,
+  maxResults: number,
+  opts: { searxngBaseUrl?: string; serperUrl?: string } = {},
+): Promise<{ text: string } | { error: string }> {
+  const trimmed = query?.trim();
+  if (!trimmed) return { error: 'query is required' };
+  const capped = Math.min(Math.max(maxResults || 5, 1), 15);
+
+  if (!searxngTripped) {
+    const searxng = await trySearxng(trimmed, capped, opts.searxngBaseUrl);
+    if ('results' in searxng && searxng.results.length > 0) {
+      searxngConsecutiveFailures = 0;
+      log(`web_search (searxng): "${trimmed}" -> ${searxng.results.length} result(s)`);
+      return { text: formatSearchResults(searxng.results) };
+    }
+
+    searxngConsecutiveFailures++;
+    const reason = 'error' in searxng ? searxng.error : 'zero results';
+    log(`web_search: SearXNG miss ${searxngConsecutiveFailures}/${SEARXNG_FAILURE_THRESHOLD} (${reason})`);
+    if (searxngConsecutiveFailures < SEARXNG_FAILURE_THRESHOLD) {
+      return { text: 'No results for this query — try rephrasing or broadening it.' };
+    }
+    searxngTripped = true;
+    log(`web_search: SearXNG hit ${SEARXNG_FAILURE_THRESHOLD} consecutive misses — switching to the Serper fallback for the rest of this run`);
+  }
+
+  const serper = await trySerper(trimmed, capped, opts.serperUrl);
+  if ('error' in serper) {
+    log(`web_search: Serper fallback also failed (${serper.error})`);
     return {
       error:
-        `Could not reach the local SearXNG instance at ${SEARXNG_BASE_URL} (${e instanceof Error ? e.message : String(e)}). ` +
-        'It may not be running — do not fall back to guessing, report search is unavailable right now.',
+        'Both SearXNG and the Serper fallback are unavailable right now. Do not fall back to guessing — report that search is unavailable.',
     };
   }
-  if (!res.ok) return { error: `Search returned HTTP ${res.status}` };
-
-  const body = await res.json().catch(() => null);
-  const results = parseSearxngResults(body, capped);
-  log(`web_search: "${trimmed}" -> ${results.length} result(s)`);
-  if (results.length === 0) {
+  log(`web_search (serper fallback): "${trimmed}" -> ${serper.results.length} result(s)`);
+  if (serper.results.length === 0) {
     return { text: 'No results for this query — try rephrasing or broadening it.' };
   }
-  return { text: results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n\n') };
+  return { text: formatSearchResults(serper.results) };
 }
 
 export async function performWebFetch(rawUrl: string, maxChars: number): Promise<{ text: string } | { error: string }> {

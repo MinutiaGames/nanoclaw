@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
 import {
+  __resetSearxngBreakerForTests,
   assertPublicUrl,
   cookieHeaderFrom,
   extractContacts,
@@ -10,7 +11,9 @@ import {
   isPrivateOrLoopbackIPv6,
   parseCookiePair,
   parseSearxngResults,
+  parseSerperResults,
   performWebFetch,
+  performWebSearch,
 } from './web-tools.js';
 
 describe('parseSearxngResults', () => {
@@ -56,6 +59,164 @@ describe('parseSearxngResults', () => {
     expect(parseSearxngResults({}, 5)).toHaveLength(0);
     expect(parseSearxngResults(null, 5)).toHaveLength(0);
     expect(parseSearxngResults({ results: 'nope' }, 5)).toHaveLength(0);
+  });
+});
+
+describe('parseSerperResults', () => {
+  const SAMPLE_RESPONSE = {
+    searchParameters: { q: 'jane doe cpa' },
+    organic: [
+      { title: 'Jane Doe CPA & Associates', link: 'https://example.com/jane-doe-cpa', snippet: 'Certified public accountant.', position: 1 },
+      { title: 'Smith Tax & Bookkeeping', link: 'https://example.org/smith-tax', snippet: 'Full-service tax prep.', position: 2 },
+    ],
+  };
+
+  test('extracts title, url (from "link"), and snippet', () => {
+    const results = parseSerperResults(SAMPLE_RESPONSE, 5);
+    expect(results).toHaveLength(2);
+    expect(results[0].title).toBe('Jane Doe CPA & Associates');
+    expect(results[0].url).toBe('https://example.com/jane-doe-cpa');
+    expect(results[0].snippet).toBe('Certified public accountant.');
+  });
+
+  test('respects maxResults', () => {
+    expect(parseSerperResults(SAMPLE_RESPONSE, 1)).toHaveLength(1);
+  });
+
+  test('skips entries missing a title or link', () => {
+    const results = parseSerperResults(
+      { organic: [{ title: '', link: 'https://example.com', snippet: 'x' }, { title: 'No link', snippet: 'x' }] },
+      5,
+    );
+    expect(results).toHaveLength(0);
+  });
+
+  test('non-array/missing organic returns no results', () => {
+    expect(parseSerperResults({}, 5)).toHaveLength(0);
+    expect(parseSerperResults(null, 5)).toHaveLength(0);
+    expect(parseSerperResults({ organic: 'nope' }, 5)).toHaveLength(0);
+  });
+});
+
+describe('performWebSearch — SearXNG-primary / Serper-fallback breaker', () => {
+  let searxngServer: ReturnType<typeof Bun.serve> | null = null;
+  let serperServer: ReturnType<typeof Bun.serve> | null = null;
+
+  afterEach(() => {
+    searxngServer?.stop(true);
+    serperServer?.stop(true);
+    searxngServer = null;
+    serperServer = null;
+    __resetSearxngBreakerForTests();
+  });
+
+  /** A fake SearXNG that returns `results` on every call and counts how many times it was hit. */
+  function startFakeSearxng(results: Array<{ title: string; url: string; content: string }>): { url: string; hits: () => number } {
+    let hitCount = 0;
+    searxngServer = Bun.serve({
+      port: 0,
+      fetch() {
+        hitCount++;
+        return Response.json({ results });
+      },
+    });
+    return { url: `http://localhost:${searxngServer.port}`, hits: () => hitCount };
+  }
+
+  function startFakeSerper(organic: Array<{ title: string; link: string; snippet: string }>): { url: string; hits: () => number } {
+    let hitCount = 0;
+    serperServer = Bun.serve({
+      port: 0,
+      fetch() {
+        hitCount++;
+        return Response.json({ organic });
+      },
+    });
+    return { url: `http://localhost:${serperServer.port}`, hits: () => hitCount };
+  }
+
+  test('returns SearXNG results directly when it has results — never calls Serper', async () => {
+    const searxng = startFakeSearxng([{ title: 'Real Firm', url: 'https://example.com', content: 'A real CPA firm.' }]);
+    const result = await performWebSearch('jane doe cpa', 5, { searxngBaseUrl: searxng.url, serperUrl: 'http://127.0.0.1:1' });
+    expect('text' in result && result.text).toContain('Real Firm');
+    expect(searxng.hits()).toBe(1);
+  });
+
+  test('two SearXNG misses (below threshold 3) do not trip the breaker', async () => {
+    const searxng = startFakeSearxng([]); // always empty
+    await performWebSearch('q1', 5, { searxngBaseUrl: searxng.url });
+    const second = await performWebSearch('q2', 5, { searxngBaseUrl: searxng.url });
+    expect('text' in second && second.text).toContain('No results');
+    expect(searxng.hits()).toBe(2); // both calls hit SearXNG — not tripped yet
+  });
+
+  test('third consecutive SearXNG miss trips the breaker and falls to Serper', async () => {
+    const searxng = startFakeSearxng([]); // always empty -> 3 misses
+    const serper = startFakeSerper([{ title: 'From Serper', link: 'https://example.com/serper', snippet: 'Found via fallback.' }]);
+    await performWebSearch('q1', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    await performWebSearch('q2', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    const third = await performWebSearch('q3', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    expect('text' in third && third.text).toContain('From Serper');
+    expect(searxng.hits()).toBe(3);
+    expect(serper.hits()).toBe(1);
+  });
+
+  test('once tripped, stays on Serper for the rest of the run — never re-probes SearXNG', async () => {
+    const searxng = startFakeSearxng([]);
+    const serper = startFakeSerper([{ title: 'From Serper', link: 'https://example.com/serper', snippet: 'x' }]);
+    for (let i = 0; i < 3; i++) await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    expect(searxng.hits()).toBe(3);
+
+    const fourth = await performWebSearch('q4', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    expect('text' in fourth && fourth.text).toContain('From Serper');
+    expect(searxng.hits()).toBe(3); // unchanged — the 4th call skipped SearXNG entirely
+    expect(serper.hits()).toBe(2);
+  });
+
+  test('a SearXNG success resets the miss counter', async () => {
+    let call = 0;
+    searxngServer = Bun.serve({
+      port: 0,
+      fetch() {
+        call++;
+        // miss, miss, HIT, miss, miss, miss -> should take 3 misses *after* the
+        // reset to trip, i.e. 6 total calls, not trip on the 5th (2+3).
+        return call === 3 ? Response.json({ results: [{ title: 'Recovered', url: 'https://x.com', content: 'x' }] }) : Response.json({ results: [] });
+      },
+    });
+    const searxngUrl = `http://localhost:${searxngServer.port}`;
+    const serper = startFakeSerper([{ title: 'From Serper', link: 'https://example.com/serper', snippet: 'x' }]);
+
+    await performWebSearch('q1', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 1
+    await performWebSearch('q2', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 2
+    const third = await performWebSearch('q3', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // hit -> reset
+    expect('text' in third && third.text).toContain('Recovered');
+
+    await performWebSearch('q4', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 1 (post-reset)
+    await performWebSearch('q5', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 2 (post-reset)
+    expect(serper.hits()).toBe(0); // not tripped yet — only 2 misses since the reset
+    const sixth = await performWebSearch('q6', 5, { searxngBaseUrl: searxngUrl, serperUrl: serper.url }); // miss 3 -> trip
+    expect('text' in sixth && sixth.text).toContain('From Serper');
+    expect(serper.hits()).toBe(1);
+  });
+
+  test('tripped + Serper also fails -> returns an error, not a misleading "no results"', async () => {
+    const searxng = startFakeSearxng([]);
+    for (let i = 0; i < 3; i++) {
+      await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url, serperUrl: 'http://127.0.0.1:1' });
+    }
+    const result = await performWebSearch('q4', 5, { searxngBaseUrl: searxng.url, serperUrl: 'http://127.0.0.1:1' });
+    expect('error' in result).toBe(true);
+  });
+
+  test('tripped + Serper reachable but genuinely empty -> "no results", not an error', async () => {
+    const searxng = startFakeSearxng([]);
+    const serper = startFakeSerper([]);
+    for (let i = 0; i < 3; i++) {
+      await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    }
+    const result = await performWebSearch('q4', 5, { searxngBaseUrl: searxng.url, serperUrl: serper.url });
+    expect('text' in result && result.text).toContain('No results');
   });
 });
 
