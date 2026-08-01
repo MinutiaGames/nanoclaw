@@ -44,6 +44,25 @@ describe('parseLatestReading', () => {
     const csv = [header, '28.07.2026,15:32:10,54.0,58.0', '', ''].join('\n');
     expect(parseLatestReading(csv, 'GPU Temperature')?.value).toBe(54.0);
   });
+
+  it('falls back to the previous complete row when the last row is torn (fewer fields than the header)', () => {
+    const csv = [
+      header,
+      '28.07.2026,15:32:10,54.0,58.0',
+      '28.07.2026,15:32:12,72.0', // torn: HWiNFO caught mid-write, trailing field missing
+    ].join('\n');
+    expect(parseLatestReading(csv, 'GPU Hot Spot Temperature')).toEqual({
+      value: 58.0,
+      dateTime: '28.07.2026 15:32:10',
+    });
+  });
+
+  it('gives up after too many consecutive torn rows rather than scanning the whole file', () => {
+    const goodRow = '28.07.2026,15:32:10,54.0,58.0';
+    const tornRow = '28.07.2026,15:32:12,72.0';
+    const csv = [header, goodRow, tornRow, tornRow, tornRow, tornRow, tornRow].join('\n');
+    expect(parseLatestReading(csv, 'GPU Hot Spot Temperature')).toBeNull();
+  });
 });
 
 describe('SustainedThresholdTracker', () => {

@@ -46,6 +46,18 @@ export function splitCsvLine(line: string): string[] {
  * degree-sign suffix ("[°C]") depends on getting the file's byte encoding
  * exactly right, which this deliberately doesn't need to do to find the
  * column (HWiNFO's CSV export is Latin-1, not UTF-8 — confirmed live).
+ *
+ * HWiNFO appends a new row roughly every 2s. A read landing mid-append
+ * catches a torn last line — fewer fields than the header, truncated
+ * wherever the writer had gotten to (confirmed live: 18 torn reads out of
+ * 2156 rapid polls, each missing exactly the trailing columns not yet
+ * written). Since the GPU columns sit near the end of a 180-column row,
+ * a torn read reliably drops them, which used to surface as a false
+ * "column not found" — the watchdog momentarily blind despite HWiNFO
+ * logging fine. Fix: scan backward from the last line and use the first
+ * one whose field count matches the header (i.e. not mid-write); at most
+ * one poll-worth (~2s) staler than the true latest, which is negligible
+ * against a 30s sustained-threshold check.
  */
 export function parseLatestReading(csvText: string, columnSubstring: string): CsvReading | null {
   const lines = csvText.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -55,12 +67,15 @@ export function parseLatestReading(csvText: string, columnSubstring: string): Cs
   const idx = header.findIndex((h) => h.toLowerCase().includes(columnSubstring.toLowerCase()));
   if (idx < 0) return null;
 
-  const lastRow = splitCsvLine(lines[lines.length - 1]);
-  const raw = lastRow[idx];
-  const value = Number(raw);
-  if (raw === undefined || Number.isNaN(value)) return null;
-
-  return { value, dateTime: `${lastRow[0]} ${lastRow[1]}` };
+  for (let i = lines.length - 1; i >= Math.max(1, lines.length - 5); i--) {
+    const row = splitCsvLine(lines[i]);
+    if (row.length !== header.length) continue;
+    const raw = row[idx];
+    const value = Number(raw);
+    if (raw === undefined || Number.isNaN(value)) continue;
+    return { value, dateTime: `${row[0]} ${row[1]}` };
+  }
+  return null;
 }
 
 /**
