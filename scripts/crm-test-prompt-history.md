@@ -5,7 +5,41 @@ history doesn't have earlier versions of the embedded prompt — kept here
 instead so we can backtrack if a future change makes results worse, not
 better.
 
-## v4 — current (2026-07-29, this is what's live in run-crm-batch.sh)
+## v5 — current (2026-08-01, this is what's live in run-crm-batch.sh)
+
+Added after diagnosing a 1000-run overnight batch (killed early by the user
+at run 255): 181/255 runs (71%) ended with nothing saved, and of those,
+**180/181 never even called `crm_enrich_contact`** — the loop-detector's
+soft-loop/escalating-retry auto-kill was doing exactly its job (from the
+2026-07-30 fix), but the model was giving it something to catch on almost
+every difficult contact. Root cause, confirmed by reading the reasoning
+trace across a broad sample of the failures (not guessed): a common first
+name or everyday word (Adam, Jordan, Cassandra, Killian, Beata...) pulls in
+unrelated pages (Bible, mythology, a country, a perfume brand, a
+Wikipedia name-origin entry), the model's own reasoning correctly
+identifies this ("results about the word 'Jordan' instead of the CPA"),
+but then it just reformulates a near-identical query 5-6 times instead of
+either leading with a sharper query or giving up and saving partial data.
+Confirmed NOT an infra issue: SearXNG/Serper were returning real, relevant
+results throughout (only 6/181 mentioned any HTTP error/block, all
+incidental single-site issues), GPU stayed thermally stable all night, and
+contact selection is `ORDER BY RANDOM()` so it isn't pulling easy contacts
+first. Two changes: (1) tells the model to lead with its most specific
+query (quoted full name + "CPA" + city/state or license number) instead of
+a bare name search, and explicitly names the common-name-collision pattern
+so it's recognized as a stop signal rather than a rephrase signal; (2) caps
+effort at 3 `web_search` calls per contact — past that, stop and save
+whatever's known (CRM fields + status `researched` + a note) rather than
+keep retrying. 3 was chosen to land under the loop-detector's own
+escalating-retry threshold (3) so the model should self-regulate before the
+watchdog ever needs to step in. Not yet validated against a real batch —
+see `HANDOFF.md` for the next-session plan to test this.
+
+```
+Use the crm_get_next_prospect tool (contact_type: referral_partner, max_years_licensed: 5) to pick one CPA from the CRM who hasn't been researched yet and has been licensed 5 years or less — newer licensees are the current priority, don't omit this filter. It will give you their real name, firm, and address already verified — do not question or re-derive that part. Then use web_search and web_fetch to research that specific person or firm: look for their firm's website, a public email or phone number, how long they've been in practice, and anything else useful (client reviews, specialties, social media). Lead with your MOST specific search first — the full name in quotes plus "CPA" plus their city/state or license number — rather than a bare name search; a common first name or everyday word (e.g. "Adam", "Jordan", "Cassandra", "Killian") reliably pulls in unrelated pages (Wikipedia name/word entries, mythology, geography, brands) that have nothing to do with this person. If you notice that happening — results about the word/name itself rather than a CPA or a Florida license — that's your cue to stop, not to keep rephrasing the same search. Cap yourself at 3 web_search calls for this contact: if none of them turn up a clearly-matching, individual result, stop searching entirely and call crm_enrich_contact right away with just the CRM-provided fields, status 'researched', and a note like "common name/no individual web footprint found" — do not keep retrying variations of the same query. A contact saved with minimal info beats one left unresearched because search never found a good angle. Don't bother fetching people-search/background-check sites (Whitepages, Spokeo, Radaris, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — those are paywalled and show masked placeholder data to non-subscribers, not real facts. Same goes for LinkedIn personal-profile URLs (linkedin.com/in/...) — web_fetch refuses these outright since they always hit a login wall; use the snippet text web_search already gave you for that result instead of trying to fetch the page. LinkedIn company pages (linkedin.com/company/...) are fine to fetch and often have real info. When you're done researching, call crm_enrich_contact with their contact_id and ONLY the fields you actually found — leave a field out entirely if you couldn't find it, do not guess or invent a plausible-looking value. Put any freeform findings (years in business, review rating, etc.) in the signals object. Set status to 'researched' once you've made a genuine attempt, even if you found little. Then send me a short summary of what you found and saved.
+```
+
+## v4 (2026-07-29 – 2026-08-01, superseded by v5 above)
 
 Added a LinkedIn-specific line after confirming (across every batch run so
 far) that a bare `web_fetch` of a `linkedin.com/in/...` profile URL always
