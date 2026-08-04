@@ -12,7 +12,8 @@
 # Exits non-zero on any failed stage so callers can detect failure.
 
 param(
-    [string]$Model = ""
+    [string]$Model = "",
+    [int]$MaxLoadAttempts = 20
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,10 +103,9 @@ if ($Model -ne "") {
     # separate app, Ollama, hitting the same driver offset), not an LM Studio or
     # model bug. A crashed attempt fails fast (a few seconds) and a load that
     # succeeds is stable afterward, so retrying is the practical workaround.
-    $maxLoadAttempts = 20
     $loadSucceeded = $false
-    for ($attempt = 1; $attempt -le $maxLoadAttempts; $attempt++) {
-        Write-Host "Loading model: $Model (attempt $attempt/$maxLoadAttempts)"
+    for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
+        Write-Host "Loading model: $Model (attempt $attempt/$MaxLoadAttempts)"
         & $lms load $Model -y --identifier $Model | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -eq 0) {
             $loadSucceeded = $true
@@ -120,7 +120,7 @@ if ($Model -ne "") {
         Start-Sleep -Seconds 2
     }
     if (-not $loadSucceeded) {
-        Write-Error "lms load failed after $maxLoadAttempts attempts."
+        Write-Error "lms load failed after $MaxLoadAttempts attempts."
         exit 1
     }
 
