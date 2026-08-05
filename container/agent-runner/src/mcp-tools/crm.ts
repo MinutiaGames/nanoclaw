@@ -163,7 +163,23 @@ export const crmEnrichContact: McpToolDefinition = {
     });
     if ('error' in result) return err(result.error);
 
-    const data = result.data as { contact: unknown };
+    const data = result.data as { contact: unknown; fieldsChanged?: boolean; noteAdded?: boolean };
+
+    // fieldsChanged=false means none of email/phone/website/status/signals
+    // actually landed on a column — e.g. a malformed call that lost a field
+    // (confirmed real case, contact 11384, 2026-08-05: a local model's
+    // `status` parameter leaked as literal text into `note` instead of
+    // becoming its own field). Without this check the response looks
+    // identical to a real save, so the model has no way to notice and retry.
+    if (data.fieldsChanged === false) {
+      log(`crm_enrich_contact -> id ${contact_id} call had no effect (note only: ${data.noteAdded})`);
+      return ok(
+        data.noteAdded
+          ? `Note added, but NO other fields were changed — status/email/phone/website/signals were not present in this call (or were rejected). If you intended to set any of those, call crm_enrich_contact again for contact ${contact_id} with them included as top-level fields, not folded into the note text.`
+          : `Nothing was saved — this call had no effect (no note, and no status/email/phone/website/signals present). Re-check the call and try again for contact ${contact_id} if you have findings to record.`,
+      );
+    }
+
     log(`crm_enrich_contact -> id ${contact_id} updated`);
     return ok(`Saved. Current record:\n${JSON.stringify(data.contact, null, 2)}`);
   },
