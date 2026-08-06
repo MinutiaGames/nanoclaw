@@ -102,7 +102,46 @@ Deliberately a separate prompt track, not a version of the phase-1 prompt
 above — see `project_nanoclaw_outreach_strategy` memory and `HANDOFF.md`
 for the full design discussion (2026-08-05).
 
-### v4 — current (2026-08-06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+### v5 — current (2026-08-06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+
+Adds a mechanical web_search/web_fetch budget instead of relying on prompt
+instruction alone — motivated by the full-batch verdict-quality pass this
+same session, which surfaced runs where the prompt's advisory caps weren't
+enough (see `project_nanoclaw_outreach_strategy` memory / the session
+handoff for the fuller writeup). The 6-call web_search cap now lives in
+`container/agent-runner/src/mcp-tools/research-budget.ts`, wired in at
+`crm_get_phase2_candidates` (arms the phase-2 budget) and enforced inside
+`performWebSearch`/`performWebFetch` in `web-tools.ts` — the (N+1)th call
+in either category isn't performed at all; the tool returns a
+budget-exceeded message instead. web_fetch gets the same 6-call cap for
+the first time here (v1-v4 only ever capped web_search).
+
+Paired with a new escape hatch so a hard mechanical stop doesn't throw away
+partial findings the way a watchdog kill does: if the model still believes
+more research is needed after hitting a cap, it can call
+`crm_enrich_contact` with `signals.needs_more_research=true` and status
+left at `researched` (not a final verdict) instead of guessing
+`potential`/`not_viable` on incomplete information. `crm_get_phase2_candidates`
+now draws contacts flagged this way first (oldest-flagged-first) before
+falling back to its usual random draw, so a future run picks the same
+contact back up with its own fresh budget. See leadgen-crm's
+`db/migrations/0004_needs_more_research.sql` for the new column and
+`app/api/contacts/[id]/enrich/route.ts` for the guard carve-out that lets
+this one case save `status: 'researched'` without tripping v3's
+must-verdict guard.
+
+Prompt text changes from v4: the search-cap sentence now also covers
+web_fetch and states both are enforced mechanically, not just advisory; a
+new sentence explains the needs_more_research escape hatch. Everything
+else (the three-signal research checklist, the name-collision trap
+guidance, the must-call-crm_enrich_contact requirement) is unchanged from
+v4 — not yet re-validated against a live batch as of this writing.
+
+```
+Use the crm_get_phase2_candidates tool (contact_type: referral_partner) to pull 5 already-researched CPAs from the CRM. Using ONLY the information already returned for each of the 5 — do not search the web yet — pick the single most promising one as a referral-partner candidate: favor whoever looks strongest on audience fit and reach (years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, any notes hinting at trade-client work). If several look similar, picking any reasonable one is fine, this is a coarse triage not a precise ranking. Then research ONLY that one contact — leave the other 4 completely untouched, they go back in the pool for a future run. Look specifically for: (1) whether the firm offers bookkeeping services itself — check the site's nav/services list for anything like "Bookkeeping Services"; if you see it, open that SPECIFIC page and read it, don't just infer from the label or move on. If the page describes them doing the bookkeeping work themselves (their own staff/process, no mention of outsourcing or referring it elsewhere), that's a hard disqualifier — they're a competitor, not a referral source. Only treat it as NOT disqualifying if the page explicitly says they outsource or refer bookkeeping to another firm/partner. If that specific page 404s or won't load but bookkeeping is still listed as one of their services elsewhere on the site (nav, homepage, service list), default to treating it as in-house and disqualify rather than leaving it unresolved — a firm advertising a service on its own site is offering it themselves unless stated otherwise; (2) whether the firm explicitly states it doesn't make referrals to other professionals — rare, but also a hard disqualifier if found; (3) whether the firm serves trade/contractor clients (HVAC, plumbing, electrical, construction) — check their site's services/"who we serve" page, case studies, testimonials; this is the strongest positive signal, actively look for it. Note: a firm NOT currently accepting new clients is NOT by itself a hard disqualifier — they can still be a great referral source, possibly even more motivated to refer people elsewhere since they can't take them on directly; only the two items in (1) and (2) above are hard disqualifiers. Also try to fill in any gaps in years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, or social_handles if phase 1 left them blank. You get AT MOST 6 web_search calls AND AT MOST 6 web_fetch calls total for this contact — count them as you go. These caps are now enforced mechanically, not just by this instruction: the moment you go over either one, that tool returns a budget-exceeded message instead of actually performing the call, so don't wait to self-regulate — stop as soon as you hit 6 of either and move to the verdict/save step with whatever you have, even if something's still unconfirmed. You have more room here than phase 1 because you're going deeper on one already-verified entity instead of finding one from scratch, so use the budget to actually cover the distinct things listed above (website, in-house-bookkeeping check, no-referral check, trade-client evidence, reviews, gap-filling) rather than repeating variations of the same query. Each call should be going after a genuinely different piece of information. Watch for a specific trap: a firm's name or the person's first name can collide with something totally unrelated (a large company with a similar name, a common first name pulling generic web results, a different business entirely) — if you notice your results are actually about that OTHER thing rather than the specific firm/person you're researching, that is your cue to stop searching and decide with what you have, not to keep rephrasing the query hoping the next one lands — plausible-looking results about the wrong entity are not progress. If you hit a budget cap and genuinely believe more research would change the verdict, don't guess: call crm_enrich_contact with signals.needs_more_research=true and status left at 'researched' (not a final verdict) instead of forcing potential/not_viable on incomplete information — a future phase-2 run will pick this contact back up first, with its own full budget, so nothing you've already found is wasted. Otherwise, call crm_enrich_contact for ONLY your chosen contact_id: set status to 'potential' if no hard disqualifier was found and there's a real positive signal (especially trade-client evidence), or 'not_viable' if a hard disqualifier was found or there's simply no positive signal to justify pursuing them. Save offers_bookkeeping_inhouse, explicit_no_referral, and serves_trade_clients as true/false in signals, plus whatever else you found. Put your reasoning for the verdict in note — write it so a human can understand the call without re-deriving it. YOU MUST ACTUALLY CALL crm_enrich_contact BEFORE REPLYING — a verdict written only in your reply to me is not saved anywhere in the CRM and will be lost; do not consider this task finished until that tool call has been made. Then send me a short summary: which contact you picked and why, your verdict (or that you flagged it for more research), and one line on why you passed on each of the other 4 based on what was already known about them.
+```
+
+### v4 (2026-08-06, superseded by v5 above)
 
 Fixes a real runaway-loop finding from the third live single-run test (2026-08-06,
 right after v3 shipped) — same underlying failure category already solved

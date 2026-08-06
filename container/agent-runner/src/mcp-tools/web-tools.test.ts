@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
+import { __resetResearchBudgetForTests, setResearchPhase } from './research-budget.js';
 import {
   __resetSearxngBreakerForTests,
   assertPublicUrl,
@@ -238,6 +239,70 @@ describe('performWebSearch — SearXNG-primary / Serper-fallback, per-turn', () 
     const result = await performWebSearch('q5', 5, { searxngBaseUrl: searxng.url, serperUrl });
     expect(serperHits).toBe(1); // unchanged
     expect('error' in result).toBe(true); // still reports unavailable, just without the wasted request
+  });
+});
+
+describe('performWebSearch / performWebFetch — mechanical phase-2 budget', () => {
+  let searxngServer: ReturnType<typeof Bun.serve> | null = null;
+
+  afterEach(() => {
+    searxngServer?.stop(true);
+    searxngServer = null;
+    __resetSearxngBreakerForTests();
+    __resetResearchBudgetForTests();
+  });
+
+  function startFakeSearxng(): { url: string; hits: () => number } {
+    let hitCount = 0;
+    searxngServer = Bun.serve({
+      port: 0,
+      fetch() {
+        hitCount++;
+        return Response.json({ results: [{ title: 'Real Firm', url: 'https://example.com', content: 'x' }] });
+      },
+    });
+    return { url: `http://localhost:${searxngServer.port}`, hits: () => hitCount };
+  }
+
+  test('phase1 (no cap set): 20 web_search calls all reach SearXNG for real', async () => {
+    setResearchPhase('phase1');
+    const searxng = startFakeSearxng();
+    for (let i = 0; i < 20; i++) {
+      await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url });
+    }
+    expect(searxng.hits()).toBe(20);
+  });
+
+  test('phase2: the 7th web_search call is blocked before ever reaching SearXNG', async () => {
+    setResearchPhase('phase2');
+    const searxng = startFakeSearxng();
+    for (let i = 0; i < 6; i++) {
+      const r = await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url });
+      expect('text' in r && r.text).toContain('Real Firm');
+    }
+    expect(searxng.hits()).toBe(6);
+
+    const seventh = await performWebSearch('q7', 5, { searxngBaseUrl: searxng.url });
+    expect('text' in seventh && seventh.text).toContain('budget exceeded');
+    expect('text' in seventh && seventh.text).toContain('needs_more_research');
+    expect(searxng.hits()).toBe(6); // unchanged — the 7th call never reached the network
+  });
+
+  test('phase2: the 7th web_fetch call is blocked before ever reaching URL validation, independently of web_search', async () => {
+    setResearchPhase('phase2');
+    // Exhaust the search budget — must not affect the fetch budget.
+    const searxng = startFakeSearxng();
+    for (let i = 0; i < 6; i++) await performWebSearch(`q${i}`, 5, { searxngBaseUrl: searxng.url });
+
+    // A syntactically invalid URL fails synchronously in assertPublicUrl (no
+    // network involved) — proves the budget check let these 6 calls through
+    // to real validation, without needing a live network in the test env.
+    for (let i = 0; i < 6; i++) {
+      const r = await performWebFetch('not a valid url', 5000);
+      expect('error' in r && r.error).toBe('Not a valid URL: not a valid url');
+    }
+    const seventh = await performWebFetch('not a valid url', 5000);
+    expect('text' in seventh && seventh.text).toContain('web_fetch budget exceeded');
   });
 });
 

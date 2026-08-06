@@ -37,6 +37,7 @@ import { lookup as dnsLookup } from 'dns/promises';
 
 import * as cheerio from 'cheerio';
 
+import { checkWebFetchBudget, checkWebSearchBudget } from './research-budget.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -459,6 +460,10 @@ export async function performWebSearch(
 ): Promise<{ text: string } | { error: string }> {
   const trimmed = query?.trim();
   if (!trimmed) return { error: 'query is required' };
+
+  const budgetMsg = checkWebSearchBudget();
+  if (budgetMsg) return { text: budgetMsg };
+
   const capped = Math.min(Math.max(maxResults || 5, 1), 15);
 
   const searxng = await trySearxng(trimmed, capped, opts.searxngBaseUrl);
@@ -503,6 +508,10 @@ export async function performWebSearch(
 export async function performWebFetch(rawUrl: string, maxChars: number): Promise<{ text: string } | { error: string }> {
   const trimmed = rawUrl?.trim();
   if (!trimmed) return { error: 'url is required' };
+
+  const budgetMsg = checkWebFetchBudget();
+  if (budgetMsg) return { text: budgetMsg };
+
   const capped = Math.min(Math.max(maxChars || 5000, 500), 20_000);
 
   const check = await assertFetchableUrl(trimmed);
