@@ -102,7 +102,50 @@ Deliberately a separate prompt track, not a version of the phase-1 prompt
 above — see `project_nanoclaw_outreach_strategy` memory and `HANDOFF.md`
 for the full design discussion (2026-08-05).
 
-### v2 — current (2026-08-05/06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+### v3 — current (2026-08-06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+
+Two fixes from the second live single-run test (2026-08-05 night, right
+after v2 shipped):
+
+**Fix 1 — the model reasoned to a correct verdict, said out loud "I need
+to update the CRM record," then never actually called
+crm_enrich_contact.** Picked contact 3423 (Gary Brannon, CPA — the only
+one of the 5 draws with real existing signals), fetched his site in one
+web_fetch call, found "We are unable to take new clients at this time,"
+wrote a clear NOT VIABLE verdict straight into its chat reply, and
+stopped — zero calls to crm_enrich_contact, not even a malformed one.
+DB-verified nothing changed (contact 3423 still `status='researched'`,
+`updated_at` untouched from July 28, no note added). This is a more
+serious failure mode than v1's evidence gap: it's silent data loss — no
+error, no watchdog trigger, a normal-looking chat reply, but the write
+never happened. `crm_enrich_contact`'s own "this is the ONLY thing that
+gets saved" warning only helps once the model is mid-call; it can't catch
+the tool never being invoked at all. Fixed with a hard-to-miss, explicit
+line right where the tool-call instruction lives: "YOU MUST ACTUALLY CALL
+crm_enrich_contact BEFORE REPLYING — a verdict written only in your reply
+to me is not saved anywhere in the CRM and will be lost." User's own
+framing after seeing this: hopefully a one-off, not something worth
+over-engineering around if it doesn't recur — this fix is the appropriately-
+sized response for now (a clearer instruction), not a new mechanical
+enforcement layer.
+
+**Fix 2 — "not accepting new clients" isn't a designed hard disqualifier,
+but the model treated it like one.** Same run: having found the "unable to
+take new clients" line, the model concluded NOT VIABLE on that basis
+alone — but `accepting_new_clients` was only ever meant as one of several
+inputs to the STEP-1 triage ranking (which of the 5 looks strongest), not
+a verdict-stage disqualifier alongside `offers_bookkeeping_inhouse` /
+`explicit_no_referral`. A CPA closed to new clients for their own practice
+can still be, or even be more likely to be, a good referral source — they
+have nowhere else to send people they can't take on. Added an explicit
+note clarifying this isn't a hard disqualifier and only the two named
+items are.
+
+```
+Use the crm_get_phase2_candidates tool (contact_type: referral_partner) to pull 5 already-researched CPAs from the CRM. Using ONLY the information already returned for each of the 5 — do not search the web yet — pick the single most promising one as a referral-partner candidate: favor whoever looks strongest on audience fit and reach (years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, any notes hinting at trade-client work). If several look similar, picking any reasonable one is fine, this is a coarse triage not a precise ranking. Then research ONLY that one contact — leave the other 4 completely untouched, they go back in the pool for a future run. Look specifically for: (1) whether the firm offers bookkeeping services itself — check the site's nav/services list for anything like "Bookkeeping Services"; if you see it, open that SPECIFIC page and read it, don't just infer from the label or move on. If the page describes them doing the bookkeeping work themselves (their own staff/process, no mention of outsourcing or referring it elsewhere), that's a hard disqualifier — they're a competitor, not a referral source. Only treat it as NOT disqualifying if the page explicitly says they outsource or refer bookkeeping to another firm/partner. If that specific page 404s or won't load but bookkeeping is still listed as one of their services elsewhere on the site (nav, homepage, service list), default to treating it as in-house and disqualify rather than leaving it unresolved — a firm advertising a service on its own site is offering it themselves unless stated otherwise; (2) whether the firm explicitly states it doesn't make referrals to other professionals — rare, but also a hard disqualifier if found; (3) whether the firm serves trade/contractor clients (HVAC, plumbing, electrical, construction) — check their site's services/"who we serve" page, case studies, testimonials; this is the strongest positive signal, actively look for it. Note: a firm NOT currently accepting new clients is NOT by itself a hard disqualifier — they can still be a great referral source, possibly even more motivated to refer people elsewhere since they can't take them on directly; only the two items in (1) and (2) above are hard disqualifiers. Also try to fill in any gaps in years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, or social_handles if phase 1 left them blank. Cap yourself at 6 web_search calls — you have more room here than phase 1 because you're going deeper on one already-verified entity instead of finding one from scratch, so use it to actually cover the distinct things listed above (website, in-house-bookkeeping check, no-referral check, trade-client evidence, reviews, gap-filling) rather than repeating variations of the same query. Each call should be going after a genuinely different piece of information — if you notice yourself rephrasing a query that already came up empty instead of moving to a different topic, that's your cue to stop searching and decide with what you have. Call crm_enrich_contact for ONLY your chosen contact_id: set status to 'potential' if no hard disqualifier was found and there's a real positive signal (especially trade-client evidence), or 'not_viable' if a hard disqualifier was found or there's simply no positive signal to justify pursuing them. Save offers_bookkeeping_inhouse, explicit_no_referral, and serves_trade_clients as true/false in signals, plus whatever else you found. Put your reasoning for the verdict in note — write it so a human can understand the call without re-deriving it. YOU MUST ACTUALLY CALL crm_enrich_contact BEFORE REPLYING — a verdict written only in your reply to me is not saved anywhere in the CRM and will be lost; do not consider this task finished until that tool call has been made. Then send me a short summary: which contact you picked and why, your verdict, and one line on why you passed on each of the other 4 based on what was already known about them.
+```
+
+### v2 (2026-08-05/06, superseded by v3 above)
 
 Fixed a real gap found on phase 2's very first live run (single-run test,
 2026-08-05 night): the model picked SPENCER TAX AND ACCOUNTING, LLC,
