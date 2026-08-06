@@ -15,12 +15,16 @@
 # 'not_viable', decides who's actually worth pursuing from what's already
 # researched). Mostly a prompt swap — reload scheduling and the DB-verify
 # cross-check apply identically to both, since both are still "one agent,
-# one contact, one enrich call per run" — but the watchdog's escalating-
-# retry/soft-loop thresholds are ALSO raised for --phase2 (see
-# WATCHDOG_ESCALATING_THRESHOLD/WATCHDOG_SOFT_THRESHOLD below), because
-# phase 2's higher 6-call search cap naturally produces same-contact-name-
-# prefixed calls that would otherwise trip those detectors on legitimate
-# behavior. Full prompt text + design rationale: scripts/crm-test-prompt-history.md.
+# one contact, one enrich call per run" — but two things are ALSO tuned
+# differently for --phase2 (see WATCHDOG_ESCALATING_THRESHOLD/
+# WATCHDOG_SOFT_THRESHOLD/RUN_MAX_SECS below): the watchdog's escalating-
+# retry/soft-loop thresholds are raised, because phase 2's higher 6-call
+# search cap naturally produces same-contact-name-prefixed calls that would
+# otherwise trip those detectors on legitimate behavior; and the hard
+# per-run timeout is raised, because phase 2 runs longer by design (6
+# web_search calls vs phase 1's 3, plus more web_fetch) and phase 1's
+# 600s/10min cap sits uncomfortably close to phase 2's own observed
+# 6-9.5min range. Full prompt text + design rationale: scripts/crm-test-prompt-history.md.
 # The two phases are meant to be run on alternating nights, not simultaneously
 # — phase 2 only ever touches contacts phase 1 already finished with.
 #
@@ -118,11 +122,20 @@ if [ -n "$PHASE2" ]; then
   # the prompt asks for) still fires. See crm-test-prompt-history.md.
   WATCHDOG_ESCALATING_THRESHOLD=8
   WATCHDOG_SOFT_THRESHOLD=9
+  # run-bakeoff-test.sh's own MAX_RUN_SECS default (600s/10min) was tuned to
+  # phase 1's observed ~4min avg/7min max. Phase 2 runs longer by design (up
+  # to 6 web_search calls vs phase 1's 3, plus more web_fetch calls) --
+  # observed 6-9.5min across the first three live single runs, uncomfortably
+  # close to the 600s ceiling. Raised to 780s (13min) for real margin, while
+  # staying safely under the container's own internal 900s (15min)
+  # OPENCODE_IDLE_TIMEOUT_MS so the two don't race each other.
+  RUN_MAX_SECS=780
 else
   PROMPT="$PROMPT_PHASE1"
   PHASE_LABEL="phase1"
   WATCHDOG_ESCALATING_THRESHOLD=3
   WATCHDOG_SOFT_THRESHOLD=6
+  RUN_MAX_SECS=600
 fi
 
 RELOAD_MAX_LOAD_ATTEMPTS=40
@@ -233,6 +246,7 @@ for i in $(seq 1 "$COUNT"); do
   RUN_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%S)"
   ./scripts/run-bakeoff-test.sh --prompt "$PROMPT" \
     --escalating-threshold "$WATCHDOG_ESCALATING_THRESHOLD" --soft-threshold "$WATCHDOG_SOFT_THRESHOLD" \
+    --max-run-secs "$RUN_MAX_SECS" \
     > "$LOGFILE" 2>&1
   RC=$?
   RUN_END_ISO="$(date -u +%Y-%m-%dT%H:%M:%S)"
