@@ -102,7 +102,40 @@ Deliberately a separate prompt track, not a version of the phase-1 prompt
 above — see `project_nanoclaw_outreach_strategy` memory and `HANDOFF.md`
 for the full design discussion (2026-08-05).
 
-### v1 — current (2026-08-05, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+### v2 — current (2026-08-05/06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+
+Fixed a real gap found on phase 2's very first live run (single-run test,
+2026-08-05 night): the model picked SPENCER TAX AND ACCOUNTING, LLC,
+correctly found "Bookkeeping Services" listed in the firm's own site nav
+on the first page fetch (also captured "bookkeeping" as the first entry in
+its own saved `signals.specialties`), then went looking for an explicit
+"in-house" label instead of treating "the firm lists this as one of their
+own services" as sufficient evidence — hit two 404s on guessed sub-page
+URLs, gave up, and verdicted `potential` with `offers_bookkeeping_inhouse`
+left unset and a note reading "unclear if in-house or for referral
+partnerships." User checked the live site directly afterward: it's
+unambiguous, they do it in-house, don't outsource/refer it. Confirms this
+was a real evidence-interpretation gap, not a coincidental hunch.
+
+v1's instruction ("whether the firm offers bookkeeping services itself —
+if so... hard disqualifier") stated the RULE correctly but never told the
+model what counts as sufficient evidence or what to do when the specific
+page it goes looking for isn't the one that actually has the answer. v2
+adds three concrete pieces the model was missing: (1) actually open and
+read the specific bookkeeping-services page once you see it in the
+nav/services list, don't just infer from the label; (2) only treat it as
+NOT disqualifying if that page explicitly says they outsource/refer
+bookkeeping elsewhere — silence isn't evidence of outsourcing; (3) if the
+specific page 404s (as it did live) but bookkeeping is still listed
+elsewhere on the site, default to in-house/disqualify rather than leaving
+it unresolved, since a firm advertising a service on its own site is
+offering it themselves unless stated otherwise.
+
+```
+Use the crm_get_phase2_candidates tool (contact_type: referral_partner) to pull 5 already-researched CPAs from the CRM. Using ONLY the information already returned for each of the 5 — do not search the web yet — pick the single most promising one as a referral-partner candidate: favor whoever looks strongest on audience fit and reach (years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, any notes hinting at trade-client work). If several look similar, picking any reasonable one is fine, this is a coarse triage not a precise ranking. Then research ONLY that one contact — leave the other 4 completely untouched, they go back in the pool for a future run. Look specifically for: (1) whether the firm offers bookkeeping services itself — check the site's nav/services list for anything like "Bookkeeping Services"; if you see it, open that SPECIFIC page and read it, don't just infer from the label or move on. If the page describes them doing the bookkeeping work themselves (their own staff/process, no mention of outsourcing or referring it elsewhere), that's a hard disqualifier — they're a competitor, not a referral source. Only treat it as NOT disqualifying if the page explicitly says they outsource or refer bookkeeping to another firm/partner. If that specific page 404s or won't load but bookkeeping is still listed as one of their services elsewhere on the site (nav, homepage, service list), default to treating it as in-house and disqualify rather than leaving it unresolved — a firm advertising a service on its own site is offering it themselves unless stated otherwise; (2) whether the firm explicitly states it doesn't make referrals to other professionals — rare, but also a hard disqualifier if found; (3) whether the firm serves trade/contractor clients (HVAC, plumbing, electrical, construction) — check their site's services/"who we serve" page, case studies, testimonials; this is the strongest positive signal, actively look for it. Also try to fill in any gaps in years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, or social_handles if phase 1 left them blank. Cap yourself at 6 web_search calls — you have more room here than phase 1 because you're going deeper on one already-verified entity instead of finding one from scratch, so use it to actually cover the distinct things listed above (website, in-house-bookkeeping check, no-referral check, trade-client evidence, reviews, gap-filling) rather than repeating variations of the same query. Each call should be going after a genuinely different piece of information — if you notice yourself rephrasing a query that already came up empty instead of moving to a different topic, that's your cue to stop searching and decide with what you have. Call crm_enrich_contact for ONLY your chosen contact_id: set status to 'potential' if no hard disqualifier was found and there's a real positive signal (especially trade-client evidence), or 'not_viable' if a hard disqualifier was found or there's simply no positive signal to justify pursuing them. Save offers_bookkeeping_inhouse, explicit_no_referral, and serves_trade_clients as true/false in signals, plus whatever else you found. Put your reasoning for the verdict in note — write it so a human can understand the call without re-deriving it. Then send me a short summary: which contact you picked and why, your verdict, and one line on why you passed on each of the other 4 based on what was already known about them.
+```
+
+### v1 (2026-08-05, superseded by v2 above)
 
 Search cap set at 6 web_search calls, not phase 1's 3 — deliberately higher
 because a phase-2 run is going deeper on ONE already-verified entity across
