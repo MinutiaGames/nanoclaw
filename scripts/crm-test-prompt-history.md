@@ -102,7 +102,47 @@ Deliberately a separate prompt track, not a version of the phase-1 prompt
 above — see `project_nanoclaw_outreach_strategy` memory and `HANDOFF.md`
 for the full design discussion (2026-08-05).
 
-### v3 — current (2026-08-06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+### v4 — current (2026-08-06, this is what's live in run-crm-batch.sh's PROMPT_PHASE2)
+
+Fixes a real runaway-loop finding from the third live single-run test (2026-08-06,
+right after v3 shipped) — same underlying failure category already solved
+once in phase 1 (see v5 above), recurring here because phase 2's prompt
+never got the equivalent fix.
+
+Picked **SIDRONY, LLC** ("Nabors and Sidrony, LLC") and burned **~15
+`web_search` calls** — well past the stated 6-call cap — chasing
+trade-client evidence. The firm's name collides with **Nabors Industries**
+(an unrelated oil-drilling company) and the partner's first name "Nicole"
+pulls generic Wikipedia/actress results; the model kept getting
+plausible-looking-but-irrelevant hits and kept reformulating instead of
+recognizing the collision. It only stopped because the last 3 queries
+happened to come out byte-identical, tripping the watchdog's exact-match
+detector (threshold 3, untouched by the phase-2 escalating/soft tuning) —
+if each retry had varied even slightly it might not have been caught at
+all, since the run's tool calls were interleaved with `web_fetch` often
+enough that no single-tool streak ever got long enough to trip
+`detectEscalatingRetry`/`detectSameToolStreak` (thresholds 8/9), and the
+query texts didn't share a long enough common prefix to count as
+"escalating" by that detector's own matching rule either. No data was
+lost (contact 39309 was left untouched, still `researched`, will be
+redrawn later) — just a lot of wasted time on one run.
+
+v3's cap language ("cap yourself at 6... if a query already came up empty,
+stop") didn't fire here because these queries weren't coming back
+*empty* — they came back with real, confident-looking results about the
+*wrong* entity, which reads differently to the model than "nothing found."
+v4 ports the two pieces of phase 1's proven v5 fix that phase 2 was
+missing: (1) the cap is now phrased as a hard countdown ("AT MOST 6...
+count them as you go... the moment you've used all 6, stop") rather than
+advisory; (2) explicit recognition of the name-collision trap specifically
+— results being about an unrelated same-named entity, not just empty
+results, is now called out as the stop signal.
+
+```
+Use the crm_get_phase2_candidates tool (contact_type: referral_partner) to pull 5 already-researched CPAs from the CRM. Using ONLY the information already returned for each of the 5 — do not search the web yet — pick the single most promising one as a referral-partner candidate: favor whoever looks strongest on audience fit and reach (years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, any notes hinting at trade-client work). If several look similar, picking any reasonable one is fine, this is a coarse triage not a precise ranking. Then research ONLY that one contact — leave the other 4 completely untouched, they go back in the pool for a future run. Look specifically for: (1) whether the firm offers bookkeeping services itself — check the site's nav/services list for anything like "Bookkeeping Services"; if you see it, open that SPECIFIC page and read it, don't just infer from the label or move on. If the page describes them doing the bookkeeping work themselves (their own staff/process, no mention of outsourcing or referring it elsewhere), that's a hard disqualifier — they're a competitor, not a referral source. Only treat it as NOT disqualifying if the page explicitly says they outsource or refer bookkeeping to another firm/partner. If that specific page 404s or won't load but bookkeeping is still listed as one of their services elsewhere on the site (nav, homepage, service list), default to treating it as in-house and disqualify rather than leaving it unresolved — a firm advertising a service on its own site is offering it themselves unless stated otherwise; (2) whether the firm explicitly states it doesn't make referrals to other professionals — rare, but also a hard disqualifier if found; (3) whether the firm serves trade/contractor clients (HVAC, plumbing, electrical, construction) — check their site's services/"who we serve" page, case studies, testimonials; this is the strongest positive signal, actively look for it. Note: a firm NOT currently accepting new clients is NOT by itself a hard disqualifier — they can still be a great referral source, possibly even more motivated to refer people elsewhere since they can't take them on directly; only the two items in (1) and (2) above are hard disqualifiers. Also try to fill in any gaps in years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, or social_handles if phase 1 left them blank. You get AT MOST 6 web_search calls total for this contact — count them as you go, and the moment you've used all 6, stop searching immediately and move to the verdict/save step with whatever you have, even if something's still unconfirmed. You have more room here than phase 1 because you're going deeper on one already-verified entity instead of finding one from scratch, so use it to actually cover the distinct things listed above (website, in-house-bookkeeping check, no-referral check, trade-client evidence, reviews, gap-filling) rather than repeating variations of the same query. Each call should be going after a genuinely different piece of information. Watch for a specific trap: a firm's name or the person's first name can collide with something totally unrelated (a large company with a similar name, a common first name pulling generic web results, a different business entirely) — if you notice your results are actually about that OTHER thing rather than the specific firm/person you're researching, that is your cue to stop searching and decide with what you have, not to keep rephrasing the query hoping the next one lands — plausible-looking results about the wrong entity are not progress. Call crm_enrich_contact for ONLY your chosen contact_id: set status to 'potential' if no hard disqualifier was found and there's a real positive signal (especially trade-client evidence), or 'not_viable' if a hard disqualifier was found or there's simply no positive signal to justify pursuing them. Save offers_bookkeeping_inhouse, explicit_no_referral, and serves_trade_clients as true/false in signals, plus whatever else you found. Put your reasoning for the verdict in note — write it so a human can understand the call without re-deriving it. YOU MUST ACTUALLY CALL crm_enrich_contact BEFORE REPLYING — a verdict written only in your reply to me is not saved anywhere in the CRM and will be lost; do not consider this task finished until that tool call has been made. Then send me a short summary: which contact you picked and why, your verdict, and one line on why you passed on each of the other 4 based on what was already known about them.
+```
+
+### v3 (2026-08-06, superseded by v4 above)
 
 Two fixes from the second live single-run test (2026-08-05 night, right
 after v2 shipped):
