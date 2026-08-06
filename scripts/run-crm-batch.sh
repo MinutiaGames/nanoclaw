@@ -7,7 +7,22 @@
 # nothing fancier. Not parallel: the test group/session is a single fixed
 # target and the CRM/LM Studio are shared singletons.
 #
-# Usage: ./scripts/run-crm-batch.sh [N] [--reload-every-mins N]
+# Usage: ./scripts/run-crm-batch.sh [N] [--reload-every-mins N] [--phase2]
+#
+# --phase2 switches the embedded prompt from phase 1 (crm_get_next_prospect
+# -> research -> save status 'researched', grows the researched pool) to
+# phase 2 (crm_get_phase2_candidates -> research -> save status 'potential'/
+# 'not_viable', decides who's actually worth pursuing from what's already
+# researched). Mostly a prompt swap — reload scheduling and the DB-verify
+# cross-check apply identically to both, since both are still "one agent,
+# one contact, one enrich call per run" — but the watchdog's escalating-
+# retry/soft-loop thresholds are ALSO raised for --phase2 (see
+# WATCHDOG_ESCALATING_THRESHOLD/WATCHDOG_SOFT_THRESHOLD below), because
+# phase 2's higher 6-call search cap naturally produces same-contact-name-
+# prefixed calls that would otherwise trip those detectors on legitimate
+# behavior. Full prompt text + design rationale: scripts/crm-test-prompt-history.md.
+# The two phases are meant to be run on alternating nights, not simultaneously
+# — phase 2 only ever touches contacts phase 1 already finished with.
 #
 # Each run's full output (trajectory, tool calls, final reply) goes to
 # logs/crm-batch/run-<i>-<timestamp>.log. A one-line-per-run entry is
@@ -51,6 +66,7 @@ cd "$PROJECT_ROOT"
 
 COUNT=10
 RELOAD_EVERY_SECS=""
+PHASE2=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --reload-every-mins)
@@ -59,6 +75,10 @@ while [ $# -gt 0 ]; do
       ;;
     --reload-every-mins=*)
       RELOAD_EVERY_SECS=$(( ${1#*=} * 60 ))
+      shift
+      ;;
+    --phase2)
+      PHASE2="1"
       shift
       ;;
     *)
@@ -80,7 +100,30 @@ STATUS_FILE="$STATUS_DIR/crm-batch-status.txt"
 # LEADGEN_CRM_BASE_URL is, for the DB cross-check added below.
 CRM_DB_PATH="${LEADGEN_CRM_DB_PATH:-/mnt/c/claude/leadgen-crm/data/leadgen.db}"
 
-PROMPT="Use the crm_get_next_prospect tool (contact_type: referral_partner, max_years_licensed: 5) to pick one CPA from the CRM who hasn't been researched yet and has been licensed 5 years or less — newer licensees are the current priority, don't omit this filter. It will give you their real name, firm, and address already verified — do not question or re-derive that part. Then use web_search and web_fetch to research that specific person or firm: look for their firm's website, a public email or phone number, how long they've been in practice, and anything else useful (client reviews, specialties, social media). Lead with your MOST specific search first — the full name in quotes plus \"CPA\" plus their city/state or license number — rather than a bare name search; a common first name or everyday word (e.g. \"Adam\", \"Jordan\", \"Cassandra\", \"Killian\") reliably pulls in unrelated pages (Wikipedia name/word entries, mythology, geography, brands) that have nothing to do with this person. If you notice that happening — results about the word/name itself rather than a CPA or a Florida license — that's your cue to stop, not to keep rephrasing the same search. Cap yourself at 3 web_search calls for this contact: if none of them turn up a clearly-matching, individual result, stop searching entirely and call crm_enrich_contact right away with just the CRM-provided fields, status 'researched', and a note like \"common name/no individual web footprint found\" — do not keep retrying variations of the same query. A contact saved with minimal info beats one left unresearched because search never found a good angle. Don't bother fetching people-search/background-check sites (Whitepages, Spokeo, Radaris, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — those are paywalled and show masked placeholder data to non-subscribers, not real facts. Same goes for LinkedIn personal-profile URLs (linkedin.com/in/...) — web_fetch refuses these outright since they always hit a login wall; use the snippet text web_search already gave you for that result instead of trying to fetch the page. LinkedIn company pages (linkedin.com/company/...) are fine to fetch and often have real info. When you're done researching, call crm_enrich_contact with their contact_id and ONLY the fields you actually found — leave a field out entirely if you couldn't find it, do not guess or invent a plausible-looking value. Put any freeform findings (years in business, review rating, etc.) in the signals object. Set status to 'researched' once you've made a genuine attempt, even if you found little. Then send me a short summary of what you found and saved."
+PROMPT_PHASE1="Use the crm_get_next_prospect tool (contact_type: referral_partner, max_years_licensed: 5) to pick one CPA from the CRM who hasn't been researched yet and has been licensed 5 years or less — newer licensees are the current priority, don't omit this filter. It will give you their real name, firm, and address already verified — do not question or re-derive that part. Then use web_search and web_fetch to research that specific person or firm: look for their firm's website, a public email or phone number, how long they've been in practice, and anything else useful (client reviews, specialties, social media). Lead with your MOST specific search first — the full name in quotes plus \"CPA\" plus their city/state or license number — rather than a bare name search; a common first name or everyday word (e.g. \"Adam\", \"Jordan\", \"Cassandra\", \"Killian\") reliably pulls in unrelated pages (Wikipedia name/word entries, mythology, geography, brands) that have nothing to do with this person. If you notice that happening — results about the word/name itself rather than a CPA or a Florida license — that's your cue to stop, not to keep rephrasing the same search. Cap yourself at 3 web_search calls for this contact: if none of them turn up a clearly-matching, individual result, stop searching entirely and call crm_enrich_contact right away with just the CRM-provided fields, status 'researched', and a note like \"common name/no individual web footprint found\" — do not keep retrying variations of the same query. A contact saved with minimal info beats one left unresearched because search never found a good angle. Don't bother fetching people-search/background-check sites (Whitepages, Spokeo, Radaris, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — those are paywalled and show masked placeholder data to non-subscribers, not real facts. Same goes for LinkedIn personal-profile URLs (linkedin.com/in/...) — web_fetch refuses these outright since they always hit a login wall; use the snippet text web_search already gave you for that result instead of trying to fetch the page. LinkedIn company pages (linkedin.com/company/...) are fine to fetch and often have real info. When you're done researching, call crm_enrich_contact with their contact_id and ONLY the fields you actually found — leave a field out entirely if you couldn't find it, do not guess or invent a plausible-looking value. Put any freeform findings (years in business, review rating, etc.) in the signals object. Set status to 'researched' once you've made a genuine attempt, even if you found little. Then send me a short summary of what you found and saved."
+
+PROMPT_PHASE2="Use the crm_get_phase2_candidates tool (contact_type: referral_partner) to pull 5 already-researched CPAs from the CRM. Using ONLY the information already returned for each of the 5 — do not search the web yet — pick the single most promising one as a referral-partner candidate: favor whoever looks strongest on audience fit and reach (years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, any notes hinting at trade-client work). If several look similar, picking any reasonable one is fine, this is a coarse triage not a precise ranking. Then research ONLY that one contact — leave the other 4 completely untouched, they go back in the pool for a future run. Look specifically for: (1) whether the firm offers bookkeeping services itself — if so, they're a competitor, not a referral source, that's a hard disqualifier regardless of anything else; (2) whether the firm explicitly states it doesn't make referrals to other professionals — rare, but also a hard disqualifier if found; (3) whether the firm serves trade/contractor clients (HVAC, plumbing, electrical, construction) — check their site's services/\"who we serve\" page, case studies, testimonials; this is the strongest positive signal, actively look for it. Also try to fill in any gaps in years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, or social_handles if phase 1 left them blank. Cap yourself at 6 web_search calls — you have more room here than phase 1 because you're going deeper on one already-verified entity instead of finding one from scratch, so use it to actually cover the distinct things listed above (website, in-house-bookkeeping check, no-referral check, trade-client evidence, reviews, gap-filling) rather than repeating variations of the same query. Each call should be going after a genuinely different piece of information — if you notice yourself rephrasing a query that already came up empty instead of moving to a different topic, that's your cue to stop searching and decide with what you have. Call crm_enrich_contact for ONLY your chosen contact_id: set status to 'potential' if no hard disqualifier was found and there's a real positive signal (especially trade-client evidence), or 'not_viable' if a hard disqualifier was found or there's simply no positive signal to justify pursuing them. Save offers_bookkeeping_inhouse, explicit_no_referral, and serves_trade_clients as true/false in signals, plus whatever else you found. Put your reasoning for the verdict in note — write it so a human can understand the call without re-deriving it. Then send me a short summary: which contact you picked and why, your verdict, and one line on why you passed on each of the other 4 based on what was already known about them."
+
+if [ -n "$PHASE2" ]; then
+  PROMPT="$PROMPT_PHASE2"
+  PHASE_LABEL="phase2"
+  # Phase 2's prompt (above) has the model searching the SAME contact's name
+  # up to 6 times in a row for different topics -- those calls naturally
+  # share a long argument prefix (the contact's name), which is exactly the
+  # shape agent-watchdog.ts's escalating-retry and same-tool-streak
+  # detectors key on. At phase 1's defaults (escalating=3, soft=6) a fully
+  # legitimate, cap-respecting phase-2 run would get auto-killed by its OWN
+  # correct behavior -- raised here with a few calls of headroom above the
+  # 6-call cap so the real backstop (a genuinely runaway loop well past what
+  # the prompt asks for) still fires. See crm-test-prompt-history.md.
+  WATCHDOG_ESCALATING_THRESHOLD=8
+  WATCHDOG_SOFT_THRESHOLD=9
+else
+  PROMPT="$PROMPT_PHASE1"
+  PHASE_LABEL="phase1"
+  WATCHDOG_ESCALATING_THRESHOLD=3
+  WATCHDOG_SOFT_THRESHOLD=6
+fi
 
 RELOAD_MAX_LOAD_ATTEMPTS=40
 
@@ -188,7 +231,9 @@ for i in $(seq 1 "$COUNT"); do
   echo "--- Run $i/$COUNT starting $(date -Iseconds) -> $LOGFILE ---" | tee -a "$SUMMARY"
 
   RUN_START_ISO="$(date -u +%Y-%m-%dT%H:%M:%S)"
-  ./scripts/run-bakeoff-test.sh --prompt "$PROMPT" > "$LOGFILE" 2>&1
+  ./scripts/run-bakeoff-test.sh --prompt "$PROMPT" \
+    --escalating-threshold "$WATCHDOG_ESCALATING_THRESHOLD" --soft-threshold "$WATCHDOG_SOFT_THRESHOLD" \
+    > "$LOGFILE" 2>&1
   RC=$?
   RUN_END_ISO="$(date -u +%Y-%m-%dT%H:%M:%S)"
 

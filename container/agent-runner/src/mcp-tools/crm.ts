@@ -1,17 +1,22 @@
 /**
- * crm_get_next_prospect / crm_enrich_contact — the enrichment step of the
- * lead-gen pipeline (see the leadgen-crm project). The CRM is a standalone
- * Next.js app with its own local SQLite database, running (for now, dev
- * only) as `npm run dev` outside this container — reached over HTTP, not a
- * shared file mount, matching this codebase's "one writer per DB" rule.
+ * crm_get_next_prospect / crm_enrich_contact / crm_get_phase2_candidates —
+ * the enrichment steps of the lead-gen pipeline (see the leadgen-crm
+ * project). The CRM is a standalone Next.js app with its own local SQLite
+ * database, running (for now, dev only) as `npm run dev` outside this
+ * container — reached over HTTP, not a shared file mount, matching this
+ * codebase's "one writer per DB" rule.
  *
- * Deliberately two tools, not one generic CRUD tool: pick-a-prospect and
- * write-findings are the only two operations this pipeline stage needs.
- * There is no delete/remove tool here on purpose — if a run produces bad
- * data, a human cleans it up in the dashboard; the agent should never be
- * able to remove a row. crm_enrich_contact also never overwrites `signals`
- * wholesale — the CRM API merges it server-side (json_patch), so a bad or
- * partial enrichment pass can't destroy a previous good one.
+ * Two pipeline stages share crm_enrich_contact as their single write path:
+ * phase 1 (crm_get_next_prospect -> research -> enrich, status
+ * 'researched') finds basic contact info at volume; phase 2
+ * (crm_get_phase2_candidates -> research -> enrich, status 'potential' /
+ * 'not_viable') does a deeper pass over already-researched contacts to
+ * decide who's actually worth pursuing. There is no delete/remove tool
+ * here on purpose — if a run produces bad data, a human cleans it up in
+ * the dashboard; the agent should never be able to remove a row.
+ * crm_enrich_contact also never overwrites `signals` wholesale — the CRM
+ * API merges it server-side (json_patch), so a bad or partial enrichment
+ * pass can't destroy a previous good one.
  *
  * Base URL: NanoClaw containers reach the host via `host.docker.internal`
  * for Windows-native processes (LM Studio, OneCLI), but the CRM's dev
@@ -67,7 +72,7 @@ export const crmGetNextProspect: McpToolDefinition = {
   tool: {
     name: 'crm_get_next_prospect',
     description:
-      "Get one prospect from the lead-gen CRM that hasn't been researched yet (status 'new'). Returns their name, address, license info, and any existing signals — this is real, already-verified contact data, not something to guess at. Use web_search/web_fetch (or delegate_web_research) to research this specific person/firm by name and location, then call crm_enrich_contact with what you find. If it returns no contact, the queue is empty — say so, don't invent one. Use `max_years_licensed` if your instructions specify a threshold — over 40,000 contacts are in the CRM and most aren't worth enriching yet, so narrowing by recency-of-license is how the pool gets prioritized instead of picking a purely random contact.\n\nDon't bother fetching people-search/background-check sites (Whitepages, Radaris, Spokeo, ContactOut, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — web_fetch refuses these domains outright, and even if it didn't, what they show non-subscribers is paywalled placeholder data, not real contact info (confirmed: a real fetch of a Spokeo page returned a phone number with letters in it and a nonsense email — garbage, not a real person's real info, just formatted to look plausible at a glance). Time spent on these is time not spent finding an actual source.\n\nIF THE NAME YOU FIND DOESN'T MATCH: a web search will sometimes turn up someone with a different surname in the same city/practice area (e.g. CRM says \"Peters\", search turns up a \"Trickey\" at a firm in the same town) — do NOT assume these are the same person just because the first name, city, or general practice area line up. Verify using the `license_number` this tool already gave you: look it up at the relevant state's official license/board lookup (Florida's is myfloridalicense.com/LicenseDetail.asp?id=<license_number> — confirmed working) and check what primary name that license currently shows. A real name change (marriage, etc.) will show up there under the SAME license number — that's a confirmed match, go ahead and use the new name. If you can't confirm it that way, don't assert they're the same person: either skip the mismatched info or save it with confidence \"low\" and a note explicitly flagging the unverified name mismatch, so a human knows to check it rather than assuming it's solid.",
+      "Get one prospect from the lead-gen CRM that hasn't been researched yet (status 'new'). Returns their name, address, license info, and any existing signals — this is real, already-verified contact data, not something to guess at. Use web_search/web_fetch to research this specific person/firm by name and location, then call crm_enrich_contact with what you find. If it returns no contact, the queue is empty — say so, don't invent one. Use `max_years_licensed` if your instructions specify a threshold — over 40,000 contacts are in the CRM and most aren't worth enriching yet, so narrowing by recency-of-license is how the pool gets prioritized instead of picking a purely random contact.\n\nDon't bother fetching people-search/background-check sites (Whitepages, Radaris, Spokeo, ContactOut, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar) even if they show up in search results — web_fetch refuses these domains outright, and even if it didn't, what they show non-subscribers is paywalled placeholder data, not real contact info (confirmed: a real fetch of a Spokeo page returned a phone number with letters in it and a nonsense email — garbage, not a real person's real info, just formatted to look plausible at a glance). Time spent on these is time not spent finding an actual source.\n\nIF THE NAME YOU FIND DOESN'T MATCH: a web search will sometimes turn up someone with a different surname in the same city/practice area (e.g. CRM says \"Peters\", search turns up a \"Trickey\" at a firm in the same town) — do NOT assume these are the same person just because the first name, city, or general practice area line up. Verify using the `license_number` this tool already gave you: look it up at the relevant state's official license/board lookup (Florida's is myfloridalicense.com/LicenseDetail.asp?id=<license_number> — confirmed working) and check what primary name that license currently shows. A real name change (marriage, etc.) will show up there under the SAME license number — that's a confirmed match, go ahead and use the new name. If you can't confirm it that way, don't assert they're the same person: either skip the mismatched info or save it with confidence \"low\" and a note explicitly flagging the unverified name mismatch, so a human knows to check it rather than assuming it's solid.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -109,7 +114,7 @@ export const crmEnrichContact: McpToolDefinition = {
   tool: {
     name: 'crm_enrich_contact',
     description:
-      "Save research findings for a contact from the CRM (get their id from crm_get_next_prospect first). IMPORTANT: this tool call is the ONLY thing that gets saved — your chat reply to the user is not stored anywhere in the CRM. Before you write your final summary to the user, ask yourself \"did I actually put everything I'm about to tell them into this call?\" — if you found something noteworthy (e.g. \"not accepting new clients right now\", \"license shows inactive\", \"firm appears to have closed\"), it MUST go in `signals` or `note` here, not just in your reply. Only include fields you actually found — this call is additive: `signals` is merged into whatever's already there (never wiped), and omitted fields are left untouched. If you couldn't find something, just leave it out rather than filling it with a guess. There is NO delete tool — you cannot remove a contact, only add to what's known about them. Use `note` for anything that reads better as a sentence — context, caveats, or a finding that doesn't fit a clean key/value.\n\nPRIORITIZE THESE SPECIFIC `signals` KEYS over general prose — they get pulled into their own filterable dashboard columns server-side (a human will filter/sort on them directly), and this data is what a later, separate enrichment pass will use to decide who's actually worth pursuing, so completeness on these matters more than exhaustive freeform notes: `years_in_business` (int), `firm_founded` (the actual founding year, not a duration — save both this and years_in_business if you know the founding year, they're not redundant since years_in_business would otherwise go stale), `accepting_new_clients` (true/false), `review_count` (int), `review_rating` (number), `client_count_est` (int), `social_handles` (object, e.g. `{\"linkedin\": \"https://...\"}`), and `practice_role` — one of \"solo\" (sole practitioner), \"owner\" (owns/founded the firm), \"partner\" (partner at a firm, has real authority), \"employee\" (works for someone else, no say in referral relationships — e.g. an audit manager at a large firm, in-house counsel), or \"unknown\". `practice_role` matters a lot here: someone employed by a large firm with zero autonomy (confirmed real examples: a PwC audit manager, in-house counsel at a hospital system) is not a usable referral-partner lead even though they're a real, correctly-researched person — always try to determine and save this. (See crm_get_next_prospect's description for what to do when the name you find doesn't match the CRM record.)\n\nRATE YOUR CONFIDENCE. For every field you save (email/phone/website, and each key in `signals`), also add an entry in `confidence` (\"low\"/\"medium\"/\"high\") and, where you can, `sources` (the URL or site name it came from) using the SAME field name as the key. For email/phone/website specifically: if the source you cite is a low-quality/people-search site (Whitepages, Radaris, ContactOut, Spokeo, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar background-check/people-finder sites), the VALUE gets discarded server-side, not just downgraded — these sites show paywalled placeholder data to non-subscribers, not real contact info, so there's nothing worth keeping even at low confidence. Don't assert a firm/employer association from one of these at all unless the person's actual name appears on that firm's own page. This matters most for the fields that determine who you'd actually contact or claim they work with — email, phone, firm/employer association — hold those to a real standard (an official site, a licensing board, a direct listing) before rating them medium/high. Softer signals (review sentiment, social media presence, general reputation) can honestly be lower confidence — that's expected, not a problem, just say so.",
+      "Save research findings for a contact from the CRM (get their id from crm_get_next_prospect first). IMPORTANT: this tool call is the ONLY thing that gets saved — your chat reply to the user is not stored anywhere in the CRM. Before you write your final summary to the user, ask yourself \"did I actually put everything I'm about to tell them into this call?\" — if you found something noteworthy (e.g. \"not accepting new clients right now\", \"license shows inactive\", \"firm appears to have closed\"), it MUST go in `signals` or `note` here, not just in your reply. Only include fields you actually found — this call is additive: `signals` is merged into whatever's already there (never wiped), and omitted fields are left untouched. If you couldn't find something, just leave it out rather than filling it with a guess. There is NO delete tool — you cannot remove a contact, only add to what's known about them. Use `note` for anything that reads better as a sentence — context, caveats, or a finding that doesn't fit a clean key/value.\n\nPRIORITIZE THESE SPECIFIC `signals` KEYS over general prose — they get pulled into their own filterable dashboard columns server-side (a human will filter/sort on them directly), and this data is what a later, separate enrichment pass will use to decide who's actually worth pursuing, so completeness on these matters more than exhaustive freeform notes: `years_in_business` (int), `firm_founded` (the actual founding year, not a duration — save both this and years_in_business if you know the founding year, they're not redundant since years_in_business would otherwise go stale), `accepting_new_clients` (true/false), `review_count` (int), `review_rating` (number), `client_count_est` (int), `social_handles` (object, e.g. `{\"linkedin\": \"https://...\"}`), and `practice_role` — one of \"solo\" (sole practitioner), \"owner\" (owns/founded the firm), \"partner\" (partner at a firm, has real authority), \"employee\" (works for someone else, no say in referral relationships — e.g. an audit manager at a large firm, in-house counsel), or \"unknown\". `practice_role` matters a lot here: someone employed by a large firm with zero autonomy (confirmed real examples: a PwC audit manager, in-house counsel at a hospital system) is not a usable referral-partner lead even though they're a real, correctly-researched person — always try to determine and save this. (See crm_get_next_prospect's description for what to do when the name you find doesn't match the CRM record.)\n\nPHASE 2 ONLY — if you arrived here via crm_get_phase2_candidates (not crm_get_next_prospect), also save `offers_bookkeeping_inhouse`, `explicit_no_referral`, and `serves_trade_clients` (all true/false) in `signals`, and set `status` to `potential` or `not_viable` per that tool's instructions rather than `researched`.\n\nRATE YOUR CONFIDENCE. For every field you save (email/phone/website, and each key in `signals`), also add an entry in `confidence` (\"low\"/\"medium\"/\"high\") and, where you can, `sources` (the URL or site name it came from) using the SAME field name as the key. For email/phone/website specifically: if the source you cite is a low-quality/people-search site (Whitepages, Radaris, ContactOut, Spokeo, BeenVerified, TruePeopleSearch, Intelius, MyLife, and similar background-check/people-finder sites), the VALUE gets discarded server-side, not just downgraded — these sites show paywalled placeholder data to non-subscribers, not real contact info, so there's nothing worth keeping even at low confidence. Don't assert a firm/employer association from one of these at all unless the person's actual name appears on that firm's own page. This matters most for the fields that determine who you'd actually contact or claim they work with — email, phone, firm/employer association — hold those to a real standard (an official site, a licensing board, a direct listing) before rating them medium/high. Softer signals (review sentiment, social media presence, general reputation) can honestly be lower confidence — that's expected, not a problem, just say so.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -129,6 +134,8 @@ export const crmEnrichContact: McpToolDefinition = {
             'not_interested',
             'do_not_contact',
             'bounced',
+            'potential',
+            'not_viable',
           ],
         },
         signals: {
@@ -185,4 +192,47 @@ export const crmEnrichContact: McpToolDefinition = {
   },
 };
 
-registerTools([crmGetNextProspect, crmEnrichContact]);
+export const crmGetPhase2Candidates: McpToolDefinition = {
+  tool: {
+    name: 'crm_get_phase2_candidates',
+    description:
+      "Phase 2 of the enrichment pipeline: a deeper research pass over contacts phase 1 already marked 'researched', to decide who's actually worth pursuing as a referral partner. Returns up to `count` (default 5) random already-researched contacts, each with everything phase 1 already found (practice_role, years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, social_handles, notes, etc.) — this call does NOT do any new research itself.\n\nSTEP 1 — pick ONE of the returned candidates using ONLY what's already here, before doing any web searches: favor whoever looks strongest on audience fit and reach (years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, any notes hinting at trade-client work). This is a coarse triage, not a precise ranking — if several look similarly promising, picking any reasonable one is fine.\n\nSTEP 2 — research ONLY your chosen candidate. Do NOT research or touch the other candidates at all; leave them exactly as they are, they go back in the pool for a future run. Look specifically for:\n- Does the firm offer bookkeeping services itself, in-house? If so, they are a competitor, not a referral source — this is a HARD DISQUALIFIER regardless of anything else you find.\n- Does the firm explicitly state it doesn't make referrals to other professionals? Rare, but also a HARD DISQUALIFIER if found.\n- Does the firm serve trade/contractor clients (HVAC, plumbing, electrical, construction)? Check their site's services/'who we serve' page, case studies, testimonials, industries-served lists. This is the single strongest POSITIVE indicator — actively look for it, don't just note its absence.\n- Also try to fill in any gaps phase 1 left in years_in_business, client_count_est, review_rating/review_count, accepting_new_clients, or social_handles.\nCap yourself at 6 web_search calls — more room than phase 1 since you're going deeper on one already-verified entity rather than finding one from scratch, so use it to actually cover the distinct topics above (website, in-house-bookkeeping check, no-referral check, trade-client evidence, reviews, gap-filling), not to repeat variations of the same query. If you notice yourself rephrasing a query that already came up empty instead of moving to a different topic, that's your cue to stop and decide with what you have.\n\nSTEP 3 — call crm_enrich_contact for ONLY the chosen contact_id (see that tool's PHASE 2 ONLY section): set status to `potential` if no hard disqualifier was found and there's a real positive signal (especially trade-client evidence), or `not_viable` if a hard disqualifier was found, or if there's simply no positive signal to justify pursuing them. Save `offers_bookkeeping_inhouse` / `explicit_no_referral` / `serves_trade_clients` as booleans in `signals`, plus whatever else you found. Put your reasoning for the verdict in `note` — write it so a human can understand the call without re-deriving it.\n\nAny contact listed in this response's `auto_disqualified` array was already resolved to `not_viable` server-side before you ever saw it (a known employee or a firm phase 1 already found inactive) — that's informational only, nothing for you to act on.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        contact_type: {
+          type: 'string',
+          enum: ['referral_partner', 'business_owner'],
+          description:
+            'Restrict candidates to this contact_type. Omit for either — in practice only referral_partner has researched data right now.',
+        },
+        count: {
+          type: 'integer',
+          description: 'How many candidates to draw (default 5).',
+        },
+      },
+    },
+  },
+  async handler(args) {
+    const params = new URLSearchParams();
+    if (args.contact_type) params.set('contact_type', String(args.contact_type));
+    if (args.count !== undefined) params.set('count', String(args.count));
+
+    const result = await crmFetch(`/api/contacts/phase2-candidates?${params.toString()}`);
+    if ('error' in result) return err(result.error);
+
+    const data = result.data as { candidates: unknown[]; auto_disqualified: unknown[] };
+    if (!data.candidates || data.candidates.length === 0) {
+      return ok(
+        'No researched contacts available for phase 2 right now — the pool may be exhausted, or everything currently eligible has already been auto-disqualified. Say so, do not invent a candidate.',
+      );
+    }
+
+    log(
+      `crm_get_phase2_candidates -> ${data.candidates.length} candidates, ${data.auto_disqualified?.length ?? 0} auto-disqualified this call`,
+    );
+    return ok(JSON.stringify(data, null, 2));
+  },
+};
+
+registerTools([crmGetNextProspect, crmEnrichContact, crmGetPhase2Candidates]);

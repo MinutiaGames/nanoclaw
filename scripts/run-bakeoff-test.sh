@@ -1,8 +1,10 @@
 #!/bin/bash
 #
-# Full test-run automation for the local-model bake-off (Phase 2). Replaces
-# the manual multi-step dance repeated for every run: full session wipe,
-# check OneCLI's still up, send the prompt, verify the spawned container is
+# Full test-run automation, originally built for the local-model bake-off
+# but now used exclusively by the CRM enrichment pipeline (both phase 1 and
+# phase 2 — see run-crm-batch.sh, the only real caller). Replaces the
+# manual multi-step dance repeated for every run: full session wipe, check
+# OneCLI's still up, send the prompt, verify the spawned container is
 # actually running the model .env claims, start the continuous watchdog,
 # and poll for completion — a new outbound reply, the container exiting, a
 # context-limit signal in its logs, a frozen heartbeat (possible hang), or
@@ -10,11 +12,24 @@
 # Prints the final reply and trajectory once it lands.
 #
 # Usage:
-#   ./scripts/run-bakeoff-test.sh [--prompt "..."] [--group-id ID] [--session-id ID] [--hang-after-secs N] [--max-run-secs N]
+#   ./scripts/run-bakeoff-test.sh --prompt "..." [--group-id ID] [--session-id ID] [--hang-after-secs N] [--max-run-secs N] [--escalating-threshold N] [--soft-threshold N]
 #
-# Defaults to the standard CPA-lookup bake-off prompt (kept identical
-# across runs so results stay comparable — see nanoclaw-lead-gen-roadmap
-# memory) and the fixed test group/session used throughout Phase 2.
+# --escalating-threshold / --soft-threshold pass straight through to
+# agent-watchdog.ts's own flags of the same name (defaults below match its
+# defaults, i.e. phase-1 batch behavior is unchanged unless overridden).
+# run-crm-batch.sh raises both for --phase2 runs: phase 2's own prompt has
+# the model searching the SAME contact's name up to 6 times in a row for
+# different topics (website, reviews, trade-client evidence, ...), and
+# those calls naturally share a long argument prefix (the contact's name) —
+# exactly the shape detectEscalatingRetry (agent-watchdog.ts) and
+# detectSameToolStreak both key on. At phase 1's tight defaults (3/6) a
+# fully legitimate, cap-respecting phase-2 run would get auto-killed by its
+# OWN correct behavior. See crm-test-prompt-history.md for the exact
+# phase-2 values and rationale.
+#
+# --prompt is required (no default — see the PROMPT check below for why).
+# GROUP_ID/SESSION_ID default to the fixed CRM test group/session used
+# throughout this pipeline's development.
 #
 # Safe to Ctrl-C: the watchdog it starts is killed via the EXIT trap either way.
 #
@@ -39,7 +54,9 @@ GROUP_ID="ag-1785018768958-orewco"
 SESSION_ID="sess-1785021772523-xez9ld"
 HANG_AFTER_SECS=300 # 5min — frozen-heartbeat (true hang) check, tighter than MAX_RUN_SECS since a true hang has zero activity to justify waiting longer
 MAX_RUN_SECS=600 # 10min hard cap — see rationale above
-PROMPT="Find 5 CPAs (Certified Public Accountant credential) within 25 miles of zip code 52302, along with each one's phone number and email address. Do NOT search the web or use agent-browser yourself for this — instead use the delegate_web_research tool to hand off the actual research. Call it with a narrow, specific task description each time (you can call it once for the whole thing, or once per CPA, whichever gives clearer results). Once you get results back, compile a list: Name, City, Phone, Email (write 'not found' if you can't find it)."
+ESCALATING_THRESHOLD=3 # agent-watchdog.ts default — see usage comment above for why --phase2 batches override this
+SOFT_THRESHOLD=6 # agent-watchdog.ts default — see usage comment above for why --phase2 batches override this
+PROMPT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,9 +65,22 @@ while [[ $# -gt 0 ]]; do
     --session-id) SESSION_ID="$2"; shift 2 ;;
     --hang-after-secs) HANG_AFTER_SECS="$2"; shift 2 ;;
     --max-run-secs) MAX_RUN_SECS="$2"; shift 2 ;;
+    --escalating-threshold) ESCALATING_THRESHOLD="$2"; shift 2 ;;
+    --soft-threshold) SOFT_THRESHOLD="$2"; shift 2 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -z "$PROMPT" ]; then
+  # No default on purpose: this used to fall back to the original Phase-2
+  # model-bake-off prompt (a delegate_web_research-based "find 5 CPAs near
+  # zip 52302" task), which is unrelated to the CRM enrichment pipeline
+  # this script now exclusively serves. A silent wrong-task default is
+  # worse than failing loudly — the one real caller (run-crm-batch.sh)
+  # always passes --prompt anyway.
+  echo "ERROR: --prompt is required (no default — see comment above)." >&2
+  exit 2
+fi
 
 SESS_DIR="data/v2-sessions/${GROUP_ID}/${SESSION_ID}"
 INBOUND_DB="${SESS_DIR}/inbound.db"
@@ -108,7 +138,7 @@ docker inspect "$CNAME" --format '{{range .Config.Env}}{{println .}}{{end}}' | g
 
 echo "=== Starting watchdog ==="
 WATCHDOG_LOG="$(mktemp)"
-pnpm exec tsx scripts/agent-watchdog.ts "$SESS_DIR" --threshold 3 --escalating-threshold 3 --soft-threshold 6 --kill-on-escalating-retry --kill-on-soft-loop > "$WATCHDOG_LOG" 2>&1 &
+pnpm exec tsx scripts/agent-watchdog.ts "$SESS_DIR" --threshold 3 --escalating-threshold "$ESCALATING_THRESHOLD" --soft-threshold "$SOFT_THRESHOLD" --kill-on-escalating-retry --kill-on-soft-loop > "$WATCHDOG_LOG" 2>&1 &
 WATCHDOG_PID=$!
 trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
 echo "  watchdog pid $WATCHDOG_PID, log at $WATCHDOG_LOG"
