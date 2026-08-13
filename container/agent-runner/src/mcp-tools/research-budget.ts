@@ -47,6 +47,7 @@ interface Budget {
 let budget: Budget | null = null;
 let webSearchCount = 0;
 let webFetchCount = 0;
+let lockedContactId: number | null = null;
 
 export function setResearchPhase(phase: ResearchPhase): void {
   budget =
@@ -55,6 +56,7 @@ export function setResearchPhase(phase: ResearchPhase): void {
       : { phase, webSearchCap: null, webFetchCap: null };
   webSearchCount = 0;
   webFetchCount = 0;
+  lockedContactId = null;
 }
 
 /** Test-only: this module's state is otherwise process-lifetime, which would leak between test cases. */
@@ -62,6 +64,7 @@ export function __resetResearchBudgetForTests(): void {
   budget = null;
   webSearchCount = 0;
   webFetchCount = 0;
+  lockedContactId = null;
 }
 
 const NEEDS_MORE_RESEARCH_HINT =
@@ -91,5 +94,35 @@ export function checkWebFetchBudget(): string | null {
   return (
     `web_fetch budget exceeded (${budget.webFetchCap} calls already used for this contact) — this page was NOT fetched. ` +
     `Stop fetching now and save your verdict with what you already have. ${NEEDS_MORE_RESEARCH_HINT}`
+  );
+}
+
+/**
+ * Phase 2 only: the first crm_enrich_contact call in a run locks in which
+ * contact_id this run may write to — every later call for a DIFFERENT
+ * contact_id is rejected (not saved) instead of going through. This
+ * mechanically enforces "leave the other 4 candidates untouched," which
+ * the phase-2 prompt has always said but which real batch logs
+ * (2026-08-09, confirmed worse on 2026-08-13) showed the model ignoring at
+ * a real rate — up to and including saving a `not_viable` verdict on all 4
+ * untouched candidates from phase-1 signals alone, no new research, which
+ * permanently removes them from every future draw. Same-contact repeat
+ * calls are always allowed — a legitimate idempotent-retry pattern already
+ * seen in real logs, not a violation. Phase 1 is not locked:
+ * crm_get_next_prospect only ever returns one contact per call, so there's
+ * no multi-candidate surface for this bug there.
+ */
+export function checkContactLock(contactId: number): string | null {
+  if (!budget || budget.phase !== 'phase2') return null;
+  if (lockedContactId === null) {
+    lockedContactId = contactId;
+    return null;
+  }
+  if (lockedContactId === contactId) return null;
+  return (
+    `This phase-2 run is locked to contact_id ${lockedContactId} (the first contact you called crm_enrich_contact for) — ` +
+    `nothing was saved for contact_id ${contactId}. The other candidates from crm_get_phase2_candidates must go back in the ` +
+    `pool untouched; a future phase-2 run will pick them up with their own full budget. If you're done with contact ` +
+    `${lockedContactId}, stop here — do not attempt to save anything for any other candidate this run.`
   );
 }

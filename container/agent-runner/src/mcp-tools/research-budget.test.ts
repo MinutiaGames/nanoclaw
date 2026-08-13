@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 
 import {
   __resetResearchBudgetForTests,
+  checkContactLock,
   checkWebFetchBudget,
   checkWebSearchBudget,
   setResearchPhase,
@@ -80,5 +81,60 @@ describe('phase2 — capped at 6 web_search and 6 web_fetch', () => {
     for (let i = 0; i < 20; i++) {
       expect(checkWebSearchBudget()).toBeNull();
     }
+  });
+});
+
+describe('checkContactLock', () => {
+  test('never blocks before setResearchPhase has been called', () => {
+    expect(checkContactLock(111)).toBeNull();
+    expect(checkContactLock(222)).toBeNull();
+  });
+
+  test('phase1 is never locked, even across different contact_ids', () => {
+    setResearchPhase('phase1');
+    expect(checkContactLock(111)).toBeNull();
+    expect(checkContactLock(222)).toBeNull();
+    expect(checkContactLock(333)).toBeNull();
+  });
+
+  test('phase2: first contact_id locks, repeat calls for it are always allowed', () => {
+    setResearchPhase('phase2');
+    expect(checkContactLock(111)).toBeNull();
+    expect(checkContactLock(111)).toBeNull();
+    expect(checkContactLock(111)).toBeNull();
+  });
+
+  test('phase2: a different contact_id after the lock is rejected with the locked id named', () => {
+    setResearchPhase('phase2');
+    expect(checkContactLock(111)).toBeNull();
+
+    const rejection = checkContactLock(222);
+    expect(rejection).not.toBeNull();
+    expect(rejection).toContain('locked to contact_id 111');
+    expect(rejection).toContain('222');
+
+    // Stays locked — doesn't get overwritten by the rejected attempt.
+    expect(checkContactLock(111)).toBeNull();
+    expect(checkContactLock(333)).not.toBeNull();
+  });
+
+  test('a fresh setResearchPhase(\'phase2\') call clears the lock', () => {
+    setResearchPhase('phase2');
+    checkContactLock(111);
+    expect(checkContactLock(222)).not.toBeNull();
+
+    setResearchPhase('phase2');
+    expect(checkContactLock(222)).toBeNull();
+  });
+
+  test('the web_search/web_fetch budget and the contact lock are independent', () => {
+    setResearchPhase('phase2');
+    expect(checkContactLock(111)).toBeNull();
+    for (let i = 0; i < 6; i++) checkWebSearchBudget();
+    expect(checkWebSearchBudget()).not.toBeNull(); // search budget exhausted
+
+    // Contact lock unaffected by the search budget being exhausted.
+    expect(checkContactLock(111)).toBeNull();
+    expect(checkContactLock(222)).not.toBeNull();
   });
 });
