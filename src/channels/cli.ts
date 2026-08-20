@@ -15,8 +15,15 @@
  *                             "platformId": "discord:@me:149...",
  *                             "threadId": null} }         # route to a specific mg
  *     { "text": "...", "to": {...}, "reply_to": {...} }   # + redirect replies
+ *     { "text": "...", "omitTime": true }                 # drop the <message time="..."> attr
  *   Server → client:
  *     { "text": "agent reply" }
+ *
+ * omitTime is for scripted single-shot callers (e.g. the CRM enrichment
+ * batch harness) that send the same text on every invocation with no real
+ * wall-clock meaning — a per-run-varying time attribute otherwise breaks
+ * prefix-cache reuse on the (large, byte-identical) message body that
+ * follows it. Real interactive chat clients never set this.
  *
  * The `to` and `reply_to` addressing is how admin transports (the bootstrap
  * script) inject messages targeting any wired channel. `reply_to` is a
@@ -205,6 +212,7 @@ function createAdapter(): ChannelAdapter {
       reply_to?: unknown;
       sender?: unknown;
       senderId?: unknown;
+      omitTime?: unknown;
     };
     try {
       payload = JSON.parse(line);
@@ -257,6 +265,7 @@ function createAdapter(): ChannelAdapter {
           text: payload.text,
           sender: 'cli',
           senderId: `cli:${PLATFORM_ID}`,
+          ...(payload.omitTime === true ? { omitTime: true } : {}),
         },
       });
     } catch (err) {

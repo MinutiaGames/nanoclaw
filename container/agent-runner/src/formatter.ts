@@ -174,16 +174,24 @@ function formatChatMessages(messages: MessageInRow[]): string {
 function formatSingleChat(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const sender = content.sender || content.author?.fullName || content.author?.userName || 'Unknown';
-  const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const text = content.text || '';
   const idAttr = msg.seq != null ? ` id="${msg.seq}"` : '';
+  // omitTime: scripted single-shot callers (e.g. the CRM enrichment batch
+  // harness) send the same message text on every run with no real
+  // wall-clock meaning attached to it. The `time` attribute sits before the
+  // message text within this same tag, so a per-run-varying value here
+  // breaks prefix-cache reuse (DeepInfra and similar backends cache on exact
+  // prefix match) for everything downstream — including the large, otherwise
+  // byte-identical prompt body. Real chat clients never set this, so normal
+  // conversations keep their timestamp.
+  const timeAttr = content.omitTime === true ? '' : ` time="${escapeXml(formatLocalTime(msg.timestamp, TIMEZONE))}"`;
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
   const attachmentsSuffix = formatAttachments(content.attachments);
 
   const fromAttr = originAttr(msg);
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}"${timeAttr}${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 /**

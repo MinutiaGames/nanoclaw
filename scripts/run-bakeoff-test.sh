@@ -118,7 +118,7 @@ fi
 
 echo "=== Sending prompt ==="
 CHAT_LOG="$(mktemp)"
-pnpm run chat "$PROMPT" > "$CHAT_LOG" 2>&1 &
+pnpm run chat --omit-time "$PROMPT" > "$CHAT_LOG" 2>&1 &
 disown
 echo "  sent (client has its own 600s timeout and may report failure before the container actually finishes — ignored, see log at $CHAT_LOG)"
 

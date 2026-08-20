@@ -139,6 +139,19 @@ describe('timestamp formatting', () => {
     const result = formatMessages(getPendingMessages());
     expect(result).toMatch(/(AM|PM)/);
   });
+
+  it('drops the time attribute entirely when content.omitTime is true', () => {
+    insertMessage('m1', 'chat', { sender: 'cli', text: 'hi', omitTime: true }, { timestamp: '2026-06-15T12:00:00.000Z' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).not.toContain('time="');
+    expect(result).toContain('<message sender="cli">hi</message>');
+  });
+
+  it('still renders time when omitTime is absent (default, real chat clients)', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'hi' }, { timestamp: '2026-06-15T12:00:00.000Z' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('time="');
+  });
 });
 
 describe('task timestamps', () => {

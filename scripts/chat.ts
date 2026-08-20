@@ -3,9 +3,16 @@
  *
  * Usage:
  *   pnpm run chat <message...>
+ *   pnpm run chat --omit-time <message...>
  *
  * Sends the message through the CLI channel (Unix socket) to the wired agent.
  * Reads replies until the stream goes quiet, then exits.
+ *
+ * --omit-time drops the <message time="..."> attribute the agent sees for
+ * this one message — for scripted callers (e.g. the CRM enrichment batch
+ * harness) that send identical text on every invocation and don't want a
+ * per-run-varying timestamp defeating prefix-cache reuse. Not for
+ * interactive use.
  *
  * Preconditions: NanoClaw host service running, an agent group wired to
  * `cli/local` via `/init-first-agent` or `/manage-channels`.
@@ -23,9 +30,11 @@ function socketPath(): string {
 }
 
 function main(): void {
-  const words = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const omitTime = args[0] === '--omit-time';
+  const words = omitTime ? args.slice(1) : args;
   if (words.length === 0) {
-    console.error('usage: pnpm run chat <message...>');
+    console.error('usage: pnpm run chat [--omit-time] <message...>');
     process.exit(1);
   }
   const text = words.join(' ');
@@ -56,7 +65,7 @@ function main(): void {
   }
 
   socket.on('connect', () => {
-    socket.write(JSON.stringify({ text }) + '\n');
+    socket.write(JSON.stringify({ text, ...(omitTime ? { omitTime: true } : {}) }) + '\n');
     hardTimer = setTimeout(() => {
       if (!firstReplySeen) {
         console.error(`timeout: no reply in ${TOTAL_TIMEOUT_MS}ms`);
