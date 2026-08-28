@@ -19,6 +19,8 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
+  'LEADGEN_CRM_BASE_URL',
+  'LEADGEN_CRM_SERVICE_TOKEN',
 ]);
 
 /**
@@ -79,6 +81,12 @@ export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
 export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
 export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
+
+// leadgen-crm batch-pipeline credentials — optional, passed through to the
+// container only when set. See container-runner.ts and mcp-tools/crm.ts.
+export const LEADGEN_CRM_BASE_URL = process.env.LEADGEN_CRM_BASE_URL || envConfig.LEADGEN_CRM_BASE_URL || '';
+export const LEADGEN_CRM_SERVICE_TOKEN =
+  process.env.LEADGEN_CRM_SERVICE_TOKEN || envConfig.LEADGEN_CRM_SERVICE_TOKEN || '';
 
 // Fork-bomb backstop. cgroups v2 counts THREADS, not processes, and Chromium is
 // thread-hungry — a browsing agent with several tabs open runs into the high

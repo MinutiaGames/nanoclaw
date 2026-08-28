@@ -44,6 +44,14 @@ function err(text: string) {
 }
 
 const CRM_BASE_URL = process.env.LEADGEN_CRM_BASE_URL || 'http://172.27.29.246:3000';
+// Local shared secret with the CRM's own middleware.ts, not an OneCLI-vaulted
+// credential — the CRM is a same-machine/LAN address today, not an internet
+// host, so OneCLI's HTTPS-proxy credential injection doesn't apply yet. Moves
+// to OneCLI vault once the CRM has a real HTTPS VPS URL (see MERGE-PLAN.md's
+// Phase 3 notes in the leadgen-crm/handle_our_books repos) — no further
+// change needed here for that cutover, since the header is already only
+// added when this env var is actually set.
+const CRM_SERVICE_TOKEN = process.env.LEADGEN_CRM_SERVICE_TOKEN;
 const REQUEST_TIMEOUT_MS = 10_000;
 
 async function crmFetch(
@@ -54,7 +62,11 @@ async function crmFetch(
   try {
     res = await fetch(`${CRM_BASE_URL}${path}`, {
       ...init,
-      headers: { 'Content-Type': 'application/json', ...init?.headers },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(CRM_SERVICE_TOKEN ? { Authorization: `Bearer ${CRM_SERVICE_TOKEN}` } : {}),
+        ...init?.headers,
+      },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (e) {

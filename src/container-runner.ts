@@ -19,6 +19,8 @@ import {
   CONTAINER_PIDS_LIMIT,
   DATA_DIR,
   GROUPS_DIR,
+  LEADGEN_CRM_BASE_URL,
+  LEADGEN_CRM_SERVICE_TOKEN,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -490,6 +492,13 @@ async function buildContainerArgs(
       args.push('-e', `${key}=${value}`);
     }
   }
+
+  // leadgen-crm batch-pipeline credentials — optional, only passed through
+  // if the host has them set. Local shared secret between two of the user's
+  // own processes (see MERGE-PLAN.md's Phase 3 note); moves to OneCLI vault
+  // once the CRM has a real HTTPS URL.
+  if (LEADGEN_CRM_BASE_URL) args.push('-e', `LEADGEN_CRM_BASE_URL=${LEADGEN_CRM_BASE_URL}`);
+  if (LEADGEN_CRM_SERVICE_TOKEN) args.push('-e', `LEADGEN_CRM_SERVICE_TOKEN=${LEADGEN_CRM_SERVICE_TOKEN}`);
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
   // the spawn rather than running with open egress. Otherwise the host gateway.
